@@ -13,7 +13,7 @@ No lint, test, typecheck, or formatting scripts are configured.
 
 ## Architecture
 
-Three-role agent loop that self-heals. The loop runs in `src/loop.ts`, driving independent opencode sessions per role. State persists to disk in `state/` so the system resumes after crashes.
+Three-role agent loop that self-heals. The loop runs in `src/loop.ts`, driving independent opencode sessions per role. State persists to disk in `state/` so the system resumes after crashes. A web dashboard runs alongside the loop by default (port 4097) to visualize progress in real time.
 
 ```
 Planner (src/roles/planner.ts)   → produces contract (JSON)
@@ -38,6 +38,7 @@ If evaluator fails: loop retries Generator (same session), or escalates to repla
 - Default model: `deepseek/deepseek-v4-pro` (`provider/model` format).
 - API key: read from env var (e.g. `DEEPSEEK_API_KEY`), or `doc/DEEPSEEK_KEY.md`, or `--api-key` flag.
 - Requirements file: `requirements/current.md` by default. Must be ≥ 20 chars or main.ts rejects it.
+- Dashboard: starts automatically on port 4097 (`--serve-port` to change). HTML lives at `dashboard/index.html`.
 - Doc principles (`doc/CODING_PRINCIPLES.md`, `doc/LOOP_PRINCIPLES.md`) are read at runtime and injected into role system prompts. They are not compiled or imported.
 
 ## Key source files
@@ -48,6 +49,7 @@ If evaluator fails: loop retries Generator (same session), or escalates to repla
 | `src/loop.ts` | Core loop state machine |
 | `src/config.ts` | Loads and validates AgentConfig |
 | `src/opencode.ts` | opencode SDK wrapper (start, restart, sessions, prompts) |
+| `src/dashboard.ts` | Web dashboard HTTP server (starts by default, port 4097) |
 | `src/json-parser.ts` | Robust LLM JSON extraction with 8 fallback strategies |
 | `src/state.ts` | Checkpoint/contract/eval/log persistence |
 | `src/reporter.ts` | Progress printing and report generation |

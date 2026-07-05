@@ -128,6 +128,7 @@ npx tsx src/main.ts --requirements ./my-project.md --model deepseek/deepseek-v4-
 | `--base-url` | 无 | 自定义 API 地址 |
 | `--max-retries` | `4` | 触发重新规划前的最大修复尝试次数 |
 | `--max-replans` | `2` | 判定"卡住"前的最大重新规划次数 |
+| `--serve-port` | `4097` | 仪表盘端口 |
 
 ## 需求文件格式
 
@@ -159,6 +160,27 @@ npx tsx src/main.ts --requirements ./my-project.md --model deepseek/deepseek-v4-
 
 补充信息后重新运行即可从断点继续。
 
+## Web 仪表盘
+
+运行时默认在 `http://localhost:4097` 启动实时监控仪表盘，可在浏览器中观察 Agent 的每一步操作。可通过 `--serve-port` 自定义端口。
+
+```bash
+npx tsx src/main.ts                              # 默认 http://localhost:4097
+npx tsx src/main.ts --serve-port 3000            # 自定义端口
+```
+
+仪表盘每 2 秒自动刷新，展示：
+
+| 区域 | 内容 |
+|------|------|
+| 状态栏 | 当前阶段徽章、重试/重新规划计数、模型信息 |
+| 契约面板 | 所有契约条目及通过/失败/待验证状态、进度条 |
+| 失败详情 | Evaluator 发现的每一项失败，按严重程度着色（critical/high/medium/low） |
+| 活动日志 | 追加式时间线，显示 Planner/Generator/Evaluator 每一步操作 |
+| 工作区 | 生成的文件列表，点击可预览内容 |
+
+![Dashboard Screenshot](doc/asset/dashboard_example.png)
+
 ## 项目结构
 
 ```
@@ -169,6 +191,7 @@ Selfhealing_Agent_System/
 │   ├── loop.ts              # 核心循环控制器
 │   ├── state.ts             # 状态持久化
 │   ├── opencode.ts          # opencode SDK 封装
+│   ├── dashboard.ts         # Web 仪表盘 HTTP 服务
 │   ├── reporter.ts          # 报告生成
 │   ├── types.ts             # 类型定义
 │   ├── json-parser.ts       # LLM JSON 解析 (多重修复策略)
@@ -176,6 +199,8 @@ Selfhealing_Agent_System/
 │       ├── planner.ts       # Planner 角色
 │       ├── generator.ts     # Generator 角色
 │       └── evaluator.ts     # Evaluator 角色
+├── dashboard/
+│   └── index.html           # 仪表盘前端页面
 ├── doc/                     # 设计原则文档 & API 文档
 │   ├── CODING_PRINCIPLES.md # 编码原则 (Karpathy)
 │   ├── LOOP_PRINCIPLES.md   # 循环设计原则 (Karpathy)

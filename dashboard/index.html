@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Self-Healing Code Generator — Dashboard</title>
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --pass: #3fb950;
+  --fail: #f85149;
+  --warn: #d29922;
+  --crit: #ff7b72;
+  --high: #f0883e;
+  --medium: #d29922;
+  --low: #8b949e;
+  --font: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 16px;
+  min-height: 100vh;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+.header-left { display: flex; align-items: center; gap: 12px; }
+.header-left h1 { font-size: 15px; font-weight: 600; }
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.badge-idle { background: var(--border); color: var(--muted); }
+.badge-planning { background: #1f3a5f; color: var(--accent); }
+.badge-generating { background: #1f3a5f; color: var(--accent); }
+.badge-evaluating { background: #3a2f1f; color: var(--warn); }
+.badge-fixing { background: #3a1f1f; color: var(--high); }
+.badge-replanning { background: #3a1f1f; color: var(--crit); }
+.badge-done { background: #1a3a1a; color: var(--pass); }
+.badge-stuck { background: #3a1a1a; color: var(--fail); }
+
+.header-right { display: flex; gap: 16px; color: var(--muted); font-size: 12px; }
+.header-right span { white-space: nowrap; }
+.header-right strong { color: var(--text); }
+
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px; }
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 13px;
+}
+.panel-body { padding: 8px 0; max-height: 420px; overflow-y: auto; }
+
+.progress-bar {
+  display: flex;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--border);
+  margin: 0 14px 10px;
+}
+.progress-pass { background: var(--pass); }
+.progress-fail { background: var(--fail); }
+.progress-pending { background: var(--border); }
+.progress-inprog { background: var(--accent); }
+
+.contract-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.contract-item:last-child { border-bottom: none; }
+.item-status {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.item-status.passed { background: #1a3a1a; color: var(--pass); }
+.item-status.failed { background: #3a1a1a; color: var(--fail); }
+.item-status.pending { background: var(--border); color: var(--muted); }
+.item-status.in_progress { background: #1f3a5f; color: var(--accent); }
+.item-body { flex: 1; min-width: 0; }
+.item-id { font-size: 10px; color: var(--muted); }
+.item-desc { color: var(--text); }
+.item-assertion { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.item-cat {
+  display: inline-block;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--border);
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-left: 4px;
+}
+
+.failure-item {
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.failure-item:last-child { border-bottom: none; }
+.failure-sev {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+.failure-sev.critical { background: #3a1a1a; color: var(--crit); }
+.failure-sev.high { background: #3a2f1f; color: var(--high); }
+.failure-sev.medium { background: #2a2a1a; color: var(--medium); }
+.failure-sev.low { background: var(--border); color: var(--low); }
+.failure-msg { color: var(--text); }
+.failure-detail { color: var(--muted); font-size: 11px; margin-top: 2px; }
+
+.log-panel { grid-column: 1 / -1; }
+.log-entry {
+  padding: 4px 14px;
+  font-size: 11px;
+  border-bottom: 1px solid rgba(48,54,61,0.5);
+  display: flex;
+  gap: 8px;
+}
+.log-time { color: var(--muted); flex-shrink: 0; }
+.log-role {
+  flex-shrink: 0;
+  display: inline-block;
+  padding: 0 4px;
+  border-radius: 2px;
+  font-size: 10px;
+  font-weight: 600;
+}
+.log-role.planner { background: #1f3a5f; color: var(--accent); }
+.log-role.generator { background: #2a1f3a; color: #bc8cff; }
+.log-role.evaluator { background: #3a2f1f; color: var(--warn); }
+.log-role.system { background: var(--border); color: var(--muted); }
+.log-action { color: var(--text); font-size: 10px; flex-shrink: 0; }
+.log-detail { color: var(--text); flex: 1; word-break: break-all; }
+
+.workspace-panel { grid-column: 1 / -1; }
+.workspace-files { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 14px; }
+.ws-file {
+  font-size: 11px;
+  padding: 2px 8px;
+  background: var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.ws-file:hover { background: #404a55; }
+
+.empty-state {
+  padding: 24px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.modal-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 100;
+  justify-content: center;
+  align-items: center;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  width: 80vw;
+  max-width: 900px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+}
+.modal-body {
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+}
+.modal-body pre {
+  font-family: var(--font);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.error-banner {
+  background: #3a1a1a;
+  color: var(--fail);
+  padding: 8px 14px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  border: 1px solid #5a2a2a;
+  font-size: 12px;
+  display: none;
+}
+.error-banner.active { display: block; }
+
+.pulse { animation: pulse 1.5s ease-in-out infinite; }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+</style>
+</head>
+<body>
+
+<div class="error-banner" id="error-banner"></div>
+
+<div class="header">
+  <div class="header-left">
+    <h1>Self-Healing Code Generator</h1>
+    <span class="badge badge-idle pulse" id="phase-badge">IDLE</span>
+  </div>
+  <div class="header-right">
+    <span id="h-model">Model: —</span>
+    <span id="h-retries">Retries: —</span>
+    <span id="h-replans">Replans: —</span>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <div class="panel-header">
+      <span>Contract Items</span>
+      <span id="contract-summary" style="font-size:12px;font-weight:400;color:var(--muted)">—</span>
+    </div>
+    <div id="contract-progress" style="display:none">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
+    <div class="panel-body" id="contract-body">
+      <div class="empty-state">Waiting for planner to produce a contract...</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <span>Failures</span>
+      <span id="failures-count" style="font-size:12px;font-weight:400;color:var(--muted)">—</span>
+    </div>
+    <div class="panel-body" id="failures-body">
+      <div class="empty-state">No failures yet</div>
+    </div>
+  </div>
+
+  <div class="panel log-panel">
+    <div class="panel-header">Activity Log</div>
+    <div class="panel-body" id="log-body" style="max-height:280px;overflow-y:auto;">
+      <div class="empty-state">No activity yet</div>
+    </div>
+  </div>
+
+  <div class="panel workspace-panel">
+    <div class="panel-header">Workspace Files</div>
+    <div class="workspace-files" id="workspace-files">
+      <div class="empty-state">No files yet</div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="file-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <span id="modal-title">File</span>
+      <button class="modal-close" onclick="closeModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <pre id="modal-content"></pre>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+
+function apiUrl(endpoint) {
+  return API + endpoint;
+}
+
+async function fetchJson(endpoint) {
+  const res = await fetch(apiUrl(endpoint));
+  if (!res.ok) return null;
+  return res.json();
+}
+
+async function fetchText(endpoint) {
+  const res = await fetch(apiUrl(endpoint));
+  if (!res.ok) return '';
+  return res.text();
+}
+
+function setBanner(msg) {
+  const el = document.getElementById('error-banner');
+  if (msg) { el.textContent = msg; el.classList.add('active'); }
+  else { el.classList.remove('active'); }
+}
+
+function phaseClass(phase) {
+  const map = {
+    idle:'idle', planning:'planning', generating:'generating', evaluating:'evaluating',
+    fixing:'fixing', replanning:'replanning', done:'done', stuck:'stuck'
+  };
+  return map[phase] || 'idle';
+}
+
+function statusIcon(status) {
+  const map = { passed:'\u2713', failed:'\u2717', pending:'\u25E6', in_progress:'\u25CF' };
+  return map[status] || '?';
+}
+
+function sevClass(sev) {
+  return sev || 'medium';
+}
+
+function renderContract(contract, evaluation) {
+  const body = document.getElementById('contract-body');
+  const summary = document.getElementById('contract-summary');
+  const progressContainer = document.getElementById('contract-progress');
+
+  if (!contract || !contract.items) {
+    body.innerHTML = '<div class="empty-state">Waiting for planner to produce a contract...</div>';
+    summary.textContent = '—';
+    progressContainer.style.display = 'none';
+    return;
+  }
+
+  const evalMap = {};
+  if (evaluation && evaluation.failures) {
+    evaluation.failures.forEach(function(f) { evalMap[f.itemId] = 'failed'; });
+  }
+  if (evaluation && evaluation.passedCount > 0) {
+    contract.items.forEach(function(item) {
+      if (!evalMap[item.id]) evalMap[item.id] = 'passed';
+    });
+  }
+
+  let pass = 0, fail = 0, pend = 0, ip = 0;
+  let html = '';
+
+  contract.items.forEach(function(item) {
+    let status = item.status || 'pending';
+    if (evalMap[item.id] === 'failed') status = 'failed';
+    else if (evalMap[item.id] === 'passed' && status !== 'in_progress') status = 'passed';
+
+    if (status === 'passed') pass++;
+    else if (status === 'failed') fail++;
+    else if (status === 'in_progress') ip++;
+    else pend++;
+
+    html += '<div class="contract-item">' +
+      '<span class="item-status ' + status + '">' + statusIcon(status) + '</span>' +
+      '<div class="item-body">' +
+        '<span class="item-id">' + h(item.id) + '</span>' +
+        '<span class="item-cat">' + h(item.category) + '</span>' +
+        '<div class="item-desc">' + h(item.description) + '</div>' +
+        '<div class="item-assertion">' + h(item.testableAssertion) + '</div>' +
+      '</div>' +
+    '</div>';
+  });
+
+  body.innerHTML = html;
+  summary.textContent = pass + '/' + (pass+fail+pend+ip) + ' passed';
+  summary.style.color = fail > 0 ? 'var(--fail)' : pass > 0 ? 'var(--pass)' : 'var(--muted)';
+
+  progressContainer.style.display = 'block';
+  var total = pass + fail + pend + ip;
+  var pct = function(n) { return total > 0 ? (n/total*100).toFixed(1) : '0'; };
+  document.getElementById('progress-bar').innerHTML =
+    '<div class="progress-pass" style="width:' + pct(pass) + '%"></div>' +
+    '<div class="progress-fail" style="width:' + pct(fail) + '%"></div>' +
+    '<div class="progress-inprog" style="width:' + pct(ip) + '%"></div>' +
+    '<div class="progress-pending" style="flex:1"></div>';
+}
+
+function renderFailures(evaluation) {
+  const body = document.getElementById('failures-body');
+  const count = document.getElementById('failures-count');
+
+  if (!evaluation || !evaluation.failures || evaluation.failures.length === 0) {
+    body.innerHTML = '<div class="empty-state">No failures</div>';
+    count.textContent = '0 failures';
+    count.style.color = 'var(--pass)';
+    return;
+  }
+
+  const failures = evaluation.failures;
+  count.textContent = failures.length + ' failures';
+  count.style.color = 'var(--fail)';
+
+  let html = '';
+  failures.forEach(function(f) {
+    html += '<div class="failure-item">' +
+      '<span class="failure-sev ' + sevClass(f.severity) + '">' + h(f.severity) + '</span>' +
+      '<div><span class="item-id">' + h(f.itemId) + '</span></div>' +
+      '<div class="failure-msg">' + h(f.description) + '</div>' +
+      '<div class="failure-detail">' + h(f.errorDetail) + '</div>' +
+    '</div>';
+  });
+
+  body.innerHTML = html;
+}
+
+function renderLog(logText) {
+  const body = document.getElementById('log-body');
+  if (!logText) {
+    body.innerHTML = '<div class="empty-state">No activity yet</div>';
+    return;
+  }
+
+  const lines = logText.split('\n');
+  const entries = [];
+  let current = null;
+
+  lines.forEach(function(line) {
+    const m = line.match(/^## \[(.+?)\] (.+?) \| (.+?) \| (.+)$/);
+    if (m) {
+      if (current) entries.push(current);
+      current = { time: m[1], role: m[2], phase: m[3], action: m[4], detail: '' };
+    } else if (current && line.trim()) {
+      current.detail += (current.detail ? ' ' : '') + line.trim();
+    }
+  });
+  if (current) entries.push(current);
+
+  if (entries.length === 0) {
+    body.innerHTML = '<div class="empty-state">No activity yet</div>';
+    return;
+  }
+
+  let html = '';
+  const recent = entries.slice(-80);
+  recent.forEach(function(e) {
+    html += '<div class="log-entry">' +
+      '<span class="log-time">' + h(e.time) + '</span>' +
+      '<span class="log-role ' + h(e.role) + '">' + h(e.role) + '</span>' +
+      '<span class="log-action">' + h(e.action) + '</span>' +
+      '<span class="log-detail">' + h(e.detail) + '</span>' +
+    '</div>';
+  });
+
+  body.innerHTML = html;
+  body.scrollTop = body.scrollHeight;
+}
+
+function renderWorkspace(files) {
+  const el = document.getElementById('workspace-files');
+  if (!files || files.length === 0) {
+    el.innerHTML = '<div class="empty-state">No files yet</div>';
+    return;
+  }
+  let html = '';
+  files.forEach(function(f) {
+    html += '<span class="ws-file" onclick="viewFile(\'' + hAttr(f) + '\')">' + h(f) + '</span>';
+  });
+  el.innerHTML = html;
+}
+
+function renderConfig(config) {
+  if (!config) return;
+  document.getElementById('h-model').innerHTML = 'Model: <strong>' + h(config.model) + '</strong>';
+  document.getElementById('h-retries').innerHTML = 'Retries: <strong>—</strong>';
+  document.getElementById('h-replans').innerHTML = 'Replans: <strong>—</strong>';
+}
+
+function renderCheckpoint(cp) {
+  if (!cp) return;
+  const badge = document.getElementById('phase-badge');
+  badge.textContent = cp.phase ? cp.phase.toUpperCase() : 'IDLE';
+  badge.className = 'badge badge-' + phaseClass(cp.phase);
+  if (cp.phase === 'planning' || cp.phase === 'generating' || cp.phase === 'evaluating' || cp.phase === 'fixing') {
+    badge.classList.add('pulse');
+  } else {
+    badge.classList.remove('pulse');
+  }
+  document.getElementById('h-retries').innerHTML = 'Retries: <strong>' + (cp.retries || 0) + '</strong>';
+  document.getElementById('h-replans').innerHTML = 'Replans: <strong>' + (cp.replanCount || 0) + '</strong>';
+}
+
+function h(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function hAttr(s) {
+  return String(s).replace(/'/g,"\\'").replace(/"/g,'&quot;');
+}
+
+async function viewFile(name) {
+  const text = await fetchText('/api/workspace/' + encodeURIComponent(name));
+  document.getElementById('modal-title').textContent = name;
+  document.getElementById('modal-content').textContent = text;
+  document.getElementById('file-modal').classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('file-modal').classList.remove('active');
+}
+
+document.getElementById('file-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+async function refresh() {
+  try {
+    const [checkpoint, contract, evaluation, logText, workspace, config] = await Promise.all([
+      fetchJson('/api/checkpoint'),
+      fetchJson('/api/contract'),
+      fetchJson('/api/evaluation'),
+      fetchText('/api/log'),
+      fetchJson('/api/workspace'),
+      fetchJson('/api/config'),
+    ]);
+    setBanner('');
+    renderConfig(config);
+    renderCheckpoint(checkpoint);
+    renderContract(contract, evaluation);
+    renderFailures(evaluation);
+    renderLog(logText);
+    renderWorkspace(workspace ? workspace.files : []);
+  } catch (e) {
+    setBanner('Cannot connect to dashboard server. Is the agent running with --serve?');
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

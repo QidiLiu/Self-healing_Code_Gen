@@ -3,6 +3,7 @@ import { loadConfig } from "./config.js"
 import { runAgentLoop } from "./loop.js"
 import { printReport } from "./reporter.js"
 import { ensureDir, initState, clearSessionIds } from "./state.js"
+import { startDashboard, DashboardServer } from "./dashboard.js"
 import * as fs from "fs"
 
 async function main(): Promise<void> {
@@ -55,7 +56,11 @@ async function main(): Promise<void> {
   const MAX_SERVER_RESTARTS = 2
   let exitCode = 0
   let context: OpencodeContext | undefined
+  let dashboard: DashboardServer | undefined
   let restartCount = 0
+
+  const port = args.servePort ? parseInt(args.servePort, 10) : 4097
+  dashboard = startDashboard(config, port)
 
   async function runWithContext(ctx: OpencodeContext): Promise<number> {
     const report = await runAgentLoop(ctx.client, config)
@@ -122,6 +127,9 @@ async function main(): Promise<void> {
       }
     }
   } finally {
+    if (dashboard) {
+      dashboard.close()
+    }
     if (context) {
       context.server.close()
     }
@@ -201,6 +209,7 @@ Options:
   --base-url <url>         Custom base URL for the provider API
   --max-retries <n>        Max fix retries before replan (default: 4)
   --max-replans <n>        Max replans before giving up (default: 2)
+  --serve-port <n>         Dashboard port (default: 4097)
   --help, -h               Show this help
 
 Examples:
