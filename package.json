@@ -1,0 +1,20 @@
+{
+  "name": "selfhealing-agent-system",
+  "type": "module",
+  "version": "1.0.0",
+  "description": "Self-healing autonomous agent system with planner, generator, and evaluator roles",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "dev": "tsc && node dist/main.js"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.22.5",
+    "typescript": "^5.4.0"
+  }
+}

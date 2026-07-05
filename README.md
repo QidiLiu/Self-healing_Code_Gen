@@ -1,174 +1,202 @@
-# 🤖 Self-healing Code Generation: Local LLM-Assisted Code Generation & Debugging Loop
+# Self-healing Code Generator
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Local LLM](https://img.shields.io/badge/Runs%20Locally-Offline%20&%20Private-success)](https://github.com/ggml-org/llama.cpp)
+基于 [opencode SDK](https://opencode.ai) 的自我调试修复自动 Agent 系统。三角色协作（Planner / Generator / Evaluator），根据需求文档自主实现功能，遇到错误自动修复，直到达成目标或明确报告卡点。
 
-A fully offline, automated development assistant that leverages local `llama-server` (llama.cpp) to iteratively generate, test, and debug Python code based on natural language requirements. Runs entirely on your machine with GPU acceleration.
+## 架构设计
 
----
+遵循 [doc/LOOP_PRINCIPLES.md](doc/LOOP_PRINCIPLES.md) 的循环哲学：
 
-## ✨ Features
+```
+┌─────────────────────────────────────────────────┐
+│  LOAD checkpoint → 确定从哪个阶段恢复              │
+│                                                   │
+│  ┌──────────┐   ┌───────────┐   ┌────────────┐  │
+│  │ PLANNER  │──▶│ GENERATOR │──▶│ EVALUATOR  │  │
+│  │ 分析需求  │   │ 写代码    │   │ 验证+评分   │  │
+│  │ 产契约    │   │           │   │            │  │
+│  └──────────┘   └───────────┘   └────────────┘  │
+│       ▲               ▲               │         │
+│       │               │         通过？  │         │
+│       │  重新规划      │      ┌────┴────┐       │
+│       ├───────────────┘      │YES │NO  │       │
+│       │                      │    │    │       │
+│       │                      ▼    ▼    │       │
+│  ┌────┴────┐            成功报告  ┌───────────┐ │
+│  │ 卡住？  │                      │ 修复循环   │ │
+│  │ YES→USER│                      │ 错误回灌   │ │
+│  │ NO→重试  │                      │  Generator │ │
+│  └─────────┘                      └───────────┘ │
+└─────────────────────────────────────────────────┘
+```
 
-- 🔒 **100% Offline & Private**: No cloud APIs, no data leaves your machine
-- 🔄 **Iterative Self-Correction**: Automatically detects bugs, feeds execution output back to the LLM, and refines code up to 64 times
-- 🐍 **Safe Execution**: Runs generated code in a sandboxed subprocess with configurable timeouts
-- 🧠 **Smart Prompt Engineering**: Uses explicit success/failure tokens (`###SUCCESS###` / `###FAILED###`) for reliable parsing
-- 🛠️ **Fully Configurable**: Adjust project paths, LLM command, temperature, timeouts, and requirements in one place
-- 🧹 **Graceful Cleanup**: Automatically terminates the LLM server process on completion or failure
+### 三角色分离
 
----
+| 角色 | System Prompt | 职责 | 约束 |
+|------|--------------|------|------|
+| **Planner** | 技术架构师 | 将模糊需求分解为可验证的契约条款 | 不动代码，只产出 contract |
+| **Generator** | 代码执行者 | 按契约束编写实现 | **禁止评价自己的代码** |
+| **Evaluator** | 验尸官 | 运行测试、检查边界条件 | 默认代码有 bug，证明它 |
 
-## 📦 Prerequisites
+三个角色使用三个独立的 opencode session，通过文件系统通信（`state/contract.md`、`state/evaluation.json`），不依赖上下文窗口记忆。
 
-| Requirement | Details |
-|-------------|---------|
-| **Python** | `3.8` or higher |
-| **llama.cpp** | Pre-compiled `llama-server.exe` (or `.bin` for Linux/macOS) |
-| **GGUF Model** | Quantized model file (e.g., `Q4_K_M`, `Q5_K_S`) |
-| **GPU (Recommended)** | NVIDIA CUDA 11.8+ / 12.x with sufficient VRAM (24GB+ for 27B models) |
-| **Python Package** | `requests` |
+### 自愈合机制
+
+1. Evaluator 返回失败 → 记录具体错误
+2. 错误格式化后发给 Generator 修复（同一 session 续接）
+3. 重新进入 Evaluator 验证
+4. 同一错误重复 ≥maxRetries 次 → 触发 Planner 重新规划
+5. 重新规划后仍失败 ≥maxReplans 次 → 判定卡住，生成用户报告
+
+### 状态持久化
+
+崩溃后重启可从断点继续运行。
+
+| 文件 | 用途 |
+|------|------|
+| `state/checkpoint.json` | 当前阶段、session ID、重试计数 |
+| `state/contract.json` | 契约的 JSON 格式 |
+| `state/contract.md` | 可验证的契约检查清单 (Markdown) |
+| `state/progress.md` | 当前进度摘要 |
+| `state/log.md` | 追加式操作日志（`## [TIMESTAMP] ROLE \| action`） |
+| `state/evaluation.json` | 最新评估结果 |
+| `state/debug/` | JSON 解析失败的原始响应 |
+
+## 快速开始
+
+### 前置条件
+
+- Node.js >= 20
+- [opencode CLI](https://opencode.ai) 已安装
+- DeepSeek API Key（或其他 opencode 支持的提供商）
+
+### 安装
 
 ```bash
-pip install requests
+git clone <repo>
+cd Selfhealing_Agent_System
+npm install
+npm run build
 ```
 
----
+### 配置
 
-## 🚀 Installation & Setup
+将 DeepSeek API Key 写入 `doc/DEEPSEEK_KEY.md`：
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/qidiliu/Self-healing_Code_Gen.git
-   cd Self-healing_Code_Gen
-   ```
+```
+sk-your-api-key-here
+```
 
-2. **Install dependencies**
-   ```bash
-   pip install requests
-   ```
+或通过环境变量：
 
-3. **Configure the script**
-   Open `Main.py` and update the configuration block at the top:
-   ```python
-   # Point to your llama-server executable & model
-   SERVER_CMD_STR = r"C:\path\to\llama-server.exe -m C:\path\to\model.gguf -ngl 40 -c 65536"
-   
-   # Project & file paths
-   PROJECT_ROOT = Path(r"C:\Users\ben\Test\hello-world")
-   
-   # Your actual task
-   REQUIREMENT = "Write a Python script that prints 'Hello, World!' and exits successfully."
-   ```
-
-4. **Verify llama-server runs manually**
-   ```bash
-   C:\path\to\llama-server.exe -m C:\path\to\model.gguf -ngl 40 -c 65536
-   ```
-   Ensure it starts without CUDA/VRAM errors.
-
----
-
-## 🎯 Usage
-
-Run the automation loop:
 ```bash
-python python-coder/src/Main.py
+export DEEPSEEK_API_KEY=sk-your-api-key-here
 ```
 
-### What happens next?
-1. ✅ Creates `hello-world/src/Main.py` structure
-2. 🖥️ Spawns `llama-server` and waits for API readiness
-3. 📝 Sends `REQUIREMENT` → receives generated code → saves to `Main.py`
-4. ▶️ Executes code safely → captures stdout/stderr/exit code
-5. 🔍 Asks LLM to verify correctness
-6. 🔄 If failed: extracts feedback → loops back to step 3 (max 64 times)
-7. 🏁 On success or limit reached: shuts down server & prints final report
+或通过命令行参数：
 
----
-
-## ⚙️ Configuration Reference
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SERVER_CMD_STR` | Full command to start llama-server | Windows CUDA example |
-| `API_URL` | LLM API endpoint | `http://localhost:8080/completion` |
-| `MAX_ATTEMPTS` | Maximum debugging iterations | `64` |
-| `SERVER_STARTUP_TIMEOUT` | Seconds to wait for model loading | `90` |
-| `CODE_EXEC_TIMEOUT` | Max runtime for generated code | `15` |
-| `REQUIREMENT` | Natural language task description | `"Write a Python script..."` |
-
-> 💡 **Tip**: Lower `temperature` (e.g., `0.1`) for deterministic code generation. Increase `n_predict` if your LLM truncates responses.
-
----
-
-## 🔍 How It Works
-
-```
-[Start] → Create Project Structure → Launch llama-server → Wait for API
-   ↓
-[Loop ≤ 64] → Send Requirement → Generate Code → Save to Main.py
-   ↓
-Run Code → Capture Output → Send to LLM for Verification
-   ↓
-[Decision] → ###SUCCESS###? → ✅ Stop & Report → 🔚
-              ↓
-           ###FAILED###? → Extract Reason → Loop Back → 🔄
+```bash
+npx tsx src/main.ts --api-key sk-your-api-key-here
 ```
 
-The script uses explicit parsing tokens to avoid regex ambiguity when interpreting LLM feedback, ensuring robust iteration even with conversational model outputs.
+### 使用
 
----
+将需求写入 `requirements/current.md`，然后运行：
 
-## ⚠️ Security & Safety Notice
+```bash
+npm start          # 使用编译后的 JS (需先 build)
+npm run dev        # 编译并直接运行
+npx tsx src/main.ts  # 直接用 tsx 运行 TypeScript
+```
 
-- This tool **executes AI-generated Python code locally**. Always review generated code before production use.
-- Execution is sandboxed via `subprocess` with a strict timeout to prevent infinite loops or resource exhaustion.
-- Never point this at untrusted requirements or run it in privileged environments.
-- For production-grade usage, consider running inside a Docker container or virtual machine.
+或指定需求文件和参数：
 
----
+```bash
+npx tsx src/main.ts --requirements ./my-project.md --model deepseek/deepseek-v4-pro
+```
 
-## 🛠️ Troubleshooting
+### 命令行参数
 
-| Issue | Solution |
-|-------|----------|
-| `Server failed to start within timeout` | Check CUDA drivers, VRAM availability, and model path. Increase `SERVER_STARTUP_TIMEOUT`. |
-| `Connection refused to localhost:8080` | Ensure no firewall blocks port 8080. Verify llama-server is running. |
-| `Program execution timed out` | Increase `CODE_EXEC_TIMEOUT` or check for infinite loops in generated code. |
-| LLM returns conversational text instead of code | Ensure `temperature` is low (`0.0–0.2`). The prompt enforces markdown code blocks. |
-| Permission denied on folder creation | Run terminal as Administrator or change `PROJECT_ROOT` to a writable directory. |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--requirements` | `requirements/current.md` | 需求文件路径 |
+| `--workspace` | `workspace/` | 工作区目录（存放生成的代码） |
+| `--state-dir` | `state/` | 状态持久化目录 |
+| `--output-dir` | `output/` | 报告输出目录 |
+| `--model` | `deepseek/deepseek-v4-pro` | 使用的模型 (`provider/model`) |
+| `--api-key` | 从 `doc/DEEPSEEK_KEY.md` 读取 | API Key |
+| `--key-file` | `doc/DEEPSEEK_KEY.md` | API Key 文件路径 |
+| `--base-url` | 无 | 自定义 API 地址 |
+| `--max-retries` | `4` | 触发重新规划前的最大修复尝试次数 |
+| `--max-replans` | `2` | 判定"卡住"前的最大重新规划次数 |
 
----
+## 需求文件格式
 
-## 📜 License
+用自然语言描述需求即可。例如 `doc/REQUIREMENTS_EXAMPLE.md`：
 
-This project is licensed under the **MIT License**. See [LICENSE](https://github.com/QidiLiu/Self-healing_Code_Gen/blob/main/LICENSE) for details.
+```
+有图形交互界面的专门算斐波那契数列的计算程序。
 
----
+输入：第几个数
+输入：确认计算的按键
+输出：结果
+```
 
-## 🤝 Contributing
+## 输出
 
-Contributions are welcome! Please follow these steps:
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+### 成功时
 
-### Ideas for Enhancement
-- [ ] Multi-file project generation
-- [ ] Unit test integration (pytest)
-- [ ] Web UI dashboard for monitoring iterations
+- `workspace/` 包含实现的所有代码文件
+- `state/` 包含完整的运行日志和契约
+- `output/report.md` 包含成功摘要
 
----
+### 卡住时
 
-## 🙏 Acknowledgements
+报告包含：
+- 已完成哪些
+- 卡在哪个具体功能点
+- 已尝试的修复方法
+- 建议补充的信息
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) – Fast inference engine for running LLMs locally
-- [GGUF format](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) – Standardized model serialization
-- Open-source quantized models (Qwen, Llama, Mistral, etc.)
+补充信息后重新运行即可从断点继续。
 
----
+## 项目结构
 
-*Built for developers who want AI-assisted coding without leaving their machine.* 🖥️🔒
+```
+Selfhealing_Agent_System/
+├── src/
+│   ├── main.ts              # 入口文件
+│   ├── config.ts            # 配置加载
+│   ├── loop.ts              # 核心循环控制器
+│   ├── state.ts             # 状态持久化
+│   ├── opencode.ts          # opencode SDK 封装
+│   ├── reporter.ts          # 报告生成
+│   ├── types.ts             # 类型定义
+│   ├── json-parser.ts       # LLM JSON 解析 (多重修复策略)
+│   └── roles/
+│       ├── planner.ts       # Planner 角色
+│       ├── generator.ts     # Generator 角色
+│       └── evaluator.ts     # Evaluator 角色
+├── doc/                     # 设计原则文档 & API 文档
+│   ├── CODING_PRINCIPLES.md # 编码原则 (Karpathy)
+│   ├── LOOP_PRINCIPLES.md   # 循环设计原则 (Karpathy)
+│   ├── DEEPSEEK_KEY.md      # API Key (gitignore)
+│   ├── REQUIREMENTS_EXAMPLE.md # 示例需求
+│   └── OPENCODE_API_DOC.md  # opencode SDK 文档
+├── state/                   # 运行时状态目录
+├── requirements/            # 用户需求文件
+├── workspace/               # Agent 在此目录构建项目
+├── output/                  # 最终报告输出
+```
+
+## 设计原则
+
+系统严格遵循了两份原则文档：
+
+- **LOOP_PRINCIPLES.md**: 写循环而非 prompt、三角色分离、先协商契约、写磁盘不写上下文、允许重启
+- **CODING_PRINCIPLES.md**: 先读后写、最小差异、手术式修改、目标驱动、验证驱动
+
+三份原则文档在 `doc/` 目录下，运行时由系统自动读取并注入到对应角色的 system prompt 中，确保每个角色的 AI 都完整理解自己的职责和整套方法论的约束。
+
+## License
+
+MIT
