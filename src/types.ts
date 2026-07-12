@@ -71,6 +71,18 @@ export interface AgentReport {
   logPath: string
 }
 
+export interface EmailConfig {
+  enabled: boolean
+  recipient: string
+  progressIntervalMinutes: number
+}
+
+export interface ReplyPayload {
+  body: string
+  source: "cli" | "web" | "email"
+  timestamp: string
+}
+
 export interface AgentConfig {
   requirementsPath: string
   workspacePath: string
@@ -81,4 +93,5 @@ export interface AgentConfig {
   baseUrl: string | null
   maxRetries: number
   maxReplans: number
+  email: EmailConfig
 }

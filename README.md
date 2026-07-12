@@ -178,8 +178,98 @@ npx tsx src/main.ts --serve-port 3000            # 自定义端口
 | 失败详情 | Evaluator 发现的每一项失败，按严重程度着色（critical/high/medium/low） |
 | 活动日志 | 追加式时间线，显示 Planner/Generator/Evaluator 每一步操作 |
 | 工作区 | 生成的文件列表，点击可预览内容 |
+| 回复表单 | 循环终止时自动显示，可输入修改指令提交 |
 
 ![Dashboard Screenshot](doc/asset/dashboard_example.png)
+
+> **注意**: 从 v1.1 起，循环结束后仪表盘保持运行，按 Ctrl+C 退出。
+
+## 回复系统 (Reply System)
+
+循环终止后（done 或 stuck），系统等待用户通过以下任一渠道提交修改指令，自动更新需求并重启循环：
+
+| 渠道 | 说明 |
+|------|------|
+| **CLI** | 直接在终端输入指令，按两次回车提交 |
+| **Web** | 仪表盘页面显示回复表单，点击 Submit 提交 |
+| **Email** | 回复通知邮件（需配置 agently-cli） |
+
+### 指令格式
+
+支持三种操作，多个指令以 `---` 分隔：
+
+```
+修改需求: <匹配关键词>
+新内容: <替换后的完整内容>
+---
+新增需求:
+<追加的新需求>
+---
+删除需求: <匹配关键词>
+```
+
+**示例**：
+```
+修改需求: 输入验证
+新内容: 输入必须是 1-100 的正整数，超出范围提示错误
+---
+新增需求:
+增加深色模式切换按钮
+---
+删除需求: CSV导出
+```
+
+### 工作流程
+
+```
+Agent Loop 运行 → 循环终止（done/stuck）
+                    ↓
+              ┌─ 发送通知邮件（如有配置）
+              └─ 终端显示输入提示
+              └─ 仪表盘显示回复表单
+                    ↓
+         CLI / Web / Email 收到指令
+                    ↓
+         解析指令 → 修改 requirements/current.md
+                    ↓
+              重置状态 → 重新运行 Agent Loop
+```
+
+### Email 渠道配置
+
+**第 1 步 - 安装 agently-cli**
+
+```bash
+npm install -g @tencent-qqmail/agently-cli
+```
+
+**第 2 步 - OAuth 授权**
+
+```bash
+agently-cli auth login
+```
+
+**第 3 步 - 配置文件 (meta/config.ini)**
+
+```ini
+[email]
+enabled = true
+recipient = your-email@example.com
+progress_interval_minutes = 30
+```
+
+- `enabled`: 设为 `true` 启用邮件通知
+- `recipient`: 接收通知的邮箱地址
+- `progress_interval_minutes`: 进度报告发送间隔（分钟），设为 0 禁用进度报告
+
+agently-cli 未安装或未授权时，系统输出警告后继续运行（仅跳过邮件，CLI 和 Web 回复仍可用）。
+
+### 通知类型
+
+| 类型 | 触发条件 | 内容 |
+|------|---------|------|
+| 终止通知 | 循环结束（done 或 stuck） | 摘要 + 完整失败详情 |
+| 进度报告 | 循环运行超过阈值时间 | 摘要 + 失败详情 + 仪表盘链接 |
 
 ## 项目结构
 
@@ -195,12 +285,16 @@ Selfhealing_Agent_System/
 │   ├── reporter.ts          # 报告生成
 │   ├── types.ts             # 类型定义
 │   ├── json-parser.ts       # LLM JSON 解析 (多重修复策略)
+│   ├── email.ts             # 邮件通知模块 (agently-cli 封装)
+│   ├── ini-parser.ts        # INI 配置解析器
 │   └── roles/
 │       ├── planner.ts       # Planner 角色
 │       ├── generator.ts     # Generator 角色
 │       └── evaluator.ts     # Evaluator 角色
 ├── dashboard/
 │   └── index.html           # 仪表盘前端页面
+├── meta/
+│   └── config.ini           # 用户配置文件 (模型、邮件等)
 ├── doc/                     # 设计原则文档 & API 文档
 │   ├── CODING_PRINCIPLES.md # 编码原则 (Karpathy)
 │   ├── LOOP_PRINCIPLES.md   # 循环设计原则 (Karpathy)

@@ -268,6 +268,69 @@ a:hover { text-decoration: underline; }
   0%, 100% { opacity: 1; }
   50% { opacity: 0.5; }
 }
+
+.reply-panel {
+  display: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.reply-panel.active { display: block; }
+.reply-panel .reply-header {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 10px;
+  color: var(--accent);
+}
+.reply-panel textarea {
+  width: 100%;
+  min-height: 120px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px;
+  font-family: var(--font);
+  font-size: 12px;
+  resize: vertical;
+  outline: none;
+}
+.reply-panel textarea:focus {
+  border-color: var(--accent);
+}
+.reply-panel .reply-hint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 6px;
+  margin-bottom: 10px;
+}
+.reply-panel .reply-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.reply-panel button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-family: var(--font);
+  font-size: 12px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.reply-panel button:hover { opacity: 0.85; }
+.reply-panel button:disabled { opacity: 0.5; cursor: default; }
+.reply-panel .reply-success {
+  display: none;
+  color: var(--pass);
+  font-size: 12px;
+  font-weight: 600;
+}
+.reply-panel .reply-success.active { display: inline; }
 </style>
 </head>
 <body>
@@ -334,6 +397,18 @@ a:hover { text-decoration: underline; }
     <div class="modal-body">
       <pre id="modal-content"></pre>
     </div>
+  </div>
+</div>
+
+<div class="reply-panel" id="reply-panel">
+  <div class="reply-header">Reply Instructions</div>
+  <textarea id="reply-body" placeholder="修改需求:&#10;新增需求:&#10;删除需求:&#10;&#10;Separate blocks with ---"></textarea>
+  <div class="reply-hint">
+    Format: 修改需求: &lt;keyword&gt; | 新增需求: &lt;desc&gt; | 删除需求: &lt;keyword&gt;. Blocks separated by --- on its own line.
+  </div>
+  <div class="reply-actions">
+    <button id="reply-submit" onclick="submitReply()">Submit</button>
+    <span class="reply-success" id="reply-success">Submitted. Processing...</span>
   </div>
 </div>
 
@@ -529,6 +604,46 @@ function renderConfig(config) {
   document.getElementById('h-replans').innerHTML = 'Replans: <strong>—</strong>';
 }
 
+async function renderReplyPanel() {
+  const panel = document.getElementById('reply-panel');
+  try {
+    const data = await fetchJson('/api/reply-status');
+    if (data && data.waiting) {
+      panel.classList.add('active');
+    } else {
+      panel.classList.remove('active');
+      document.getElementById('reply-success').classList.remove('active');
+    }
+  } catch (e) {
+    // Silently ignore, panel stays hidden
+  }
+}
+
+async function submitReply() {
+  const body = document.getElementById('reply-body').value.trim();
+  if (!body) return;
+
+  const btn = document.getElementById('reply-submit');
+  btn.disabled = true;
+
+  try {
+    const res = await fetch(apiUrl('/api/reply'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: body }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      document.getElementById('reply-body').value = '';
+      document.getElementById('reply-success').classList.add('active');
+    }
+  } catch (e) {
+    // Silently ignore
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function renderCheckpoint(cp) {
   if (!cp) return;
   const badge = document.getElementById('phase-badge');
@@ -584,6 +699,7 @@ async function refresh() {
     renderFailures(evaluation);
     renderLog(logText);
     renderWorkspace(workspace ? workspace.files : []);
+    renderReplyPanel();
   } catch (e) {
     setBanner('Cannot connect to dashboard server. Is the agent running with --serve?');
   }

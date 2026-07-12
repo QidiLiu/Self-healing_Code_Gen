@@ -23,9 +23,20 @@ import { runEvaluator } from "./roles/evaluator.js"
 import { generateReport, printProgress } from "./reporter.js"
 import * as fs from "fs"
 
+export type ProgressTickFn = (
+  phase: AgentPhase,
+  contract: Contract | null,
+  evaluation: EvaluationResult | null,
+) => void
+
+export interface LoopOptions {
+  onProgressTick?: ProgressTickFn
+}
+
 export async function runAgentLoop(
   client: OpencodeClient,
   config: AgentConfig,
+  options?: LoopOptions,
 ): Promise<AgentReport> {
   ensureDir(config.stateDir)
   ensureDir(config.workspacePath)
@@ -36,6 +47,7 @@ export async function runAgentLoop(
   let evaluation: EvaluationResult | null = null
 
   const requirements = fs.readFileSync(config.requirementsPath, "utf-8")
+  const tick = options?.onProgressTick
 
   appendLog(config.stateDir, {
     timestamp: new Date().toISOString(),
@@ -86,6 +98,7 @@ export async function runAgentLoop(
 
         checkpoint.phase = "generating"
         saveCheckpoint(config.stateDir, checkpoint)
+        tick?.(checkpoint.phase, contract, evaluation)
         break
       }
 
@@ -127,6 +140,7 @@ export async function runAgentLoop(
 
         checkpoint.phase = "evaluating"
         saveCheckpoint(config.stateDir, checkpoint)
+        tick?.(checkpoint.phase, contract, evaluation)
         break
       }
 
@@ -188,6 +202,7 @@ export async function runAgentLoop(
         }
 
         saveCheckpoint(config.stateDir, checkpoint)
+        tick?.(checkpoint.phase, contract, evaluation)
         break
       }
 

@@ -1,6 +1,7 @@
 import * as fs from "fs"
 import * as path from "path"
-import { AgentConfig } from "./types.js"
+import { AgentConfig, EmailConfig } from "./types.js"
+import { parseIniFile } from "./ini-parser.js"
 
 function readKeyFile(keyPath: string): string {
   const content = fs.readFileSync(keyPath, "utf-8").trim()
@@ -18,6 +19,20 @@ function parseModel(model: string): { providerID: string; modelID: string } {
   }
 }
 
+const DEFAULT_EMAIL_CONFIG: EmailConfig = {
+  enabled: false,
+  recipient: "",
+  progressIntervalMinutes: 30,
+}
+
+function loadIniConfig(root: string): Record<string, Record<string, string>> {
+  const iniPath = path.join(root, "meta", "config.ini")
+  if (fs.existsSync(iniPath)) {
+    return parseIniFile(iniPath)
+  }
+  return {}
+}
+
 export function loadConfig(args: {
   requirements?: string
   workspace?: string
@@ -31,6 +46,8 @@ export function loadConfig(args: {
   maxReplans?: number
 }): AgentConfig {
   const root = process.cwd()
+  const ini = loadIniConfig(root)
+
   const keyFile = args.keyFile || path.join(root, "doc", "DEEPSEEK_KEY.md")
   let apiKey = args.apiKey || ""
 
@@ -40,8 +57,16 @@ export function loadConfig(args: {
     }
   }
 
-  const model = args.model || "deepseek/deepseek-v4-pro"
+  const model = args.model || ini.model?.provider_model || "deepseek/deepseek-v4-pro"
   parseModel(model)
+
+  const emailConfig: EmailConfig = {
+    enabled: ini.email?.enabled === "true" || DEFAULT_EMAIL_CONFIG.enabled,
+    recipient: ini.email?.recipient || DEFAULT_EMAIL_CONFIG.recipient,
+    progressIntervalMinutes: ini.email?.progress_interval_minutes
+      ? parseInt(ini.email.progress_interval_minutes, 10)
+      : DEFAULT_EMAIL_CONFIG.progressIntervalMinutes,
+  }
 
   return {
     requirementsPath: args.requirements
@@ -58,9 +83,14 @@ export function loadConfig(args: {
       : path.join(root, "output"),
     model,
     apiKey,
-    baseUrl: args.baseUrl || null,
-    maxRetries: args.maxRetries || 4,
-    maxReplans: args.maxReplans || 2,
+    baseUrl: args.baseUrl || ini.model?.base_url || null,
+    maxRetries: args.maxRetries
+      || (ini.model?.max_retries ? parseInt(ini.model.max_retries, 10) : undefined)
+      || 4,
+    maxReplans: args.maxReplans
+      || (ini.model?.max_replans ? parseInt(ini.model.max_replans, 10) : undefined)
+      || 2,
+    email: emailConfig,
   }
 }
 

@@ -46,7 +46,7 @@ function jsonResponse(
   status: number = 200,
 ): void {
   res.writeHead(status, {
-    "Content-Type": "application/json",
+    "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
   })
   res.end(JSON.stringify(data))
@@ -84,7 +84,7 @@ export function startDashboard(config: AgentConfig, port: number = 4097): Dashbo
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
         "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type",
       })
       res.end()
@@ -147,6 +147,38 @@ export function startDashboard(config: AgentConfig, port: number = 4097): Dashbo
         return textResponse(res, text)
       }
       return jsonResponse(res, { error: "File not found" }, 404)
+    }
+
+    if (url === "/api/reply-status") {
+      const cp = readJsonFile(path.join(stateDir, "checkpoint.json")) as { phase?: string } | null
+      const waiting = cp?.phase === "done" || cp?.phase === "stuck"
+      return jsonResponse(res, { waiting })
+    }
+
+    if (url === "/api/reply" && req.method === "POST") {
+      const buffers: Buffer[] = []
+      req.on("data", (chunk: Buffer) => buffers.push(chunk))
+      req.on("end", () => {
+        const raw = Buffer.concat(buffers).toString("utf-8")
+        let body = ""
+        try {
+          const parsed = JSON.parse(raw)
+          body = String(parsed.body || parsed.instructions || "")
+        } catch {
+          body = raw.trim()
+        }
+        if (!body) {
+          return jsonResponse(res, { ok: false, error: "empty body" }, 400)
+        }
+        const payload = {
+          body,
+          source: "web",
+          timestamp: new Date().toISOString(),
+        }
+        fs.writeFileSync(path.join(stateDir, "reply.json"), JSON.stringify(payload, null, 2), "utf-8")
+        return jsonResponse(res, { ok: true })
+      })
+      return
     }
 
     jsonResponse(res, { error: "Not found" }, 404)
