@@ -9,7 +9,8 @@ npm run dev             # build + run in one step
 npm run typecheck       # tsc --noEmit
 npm test                # unit + integration tests (node:test via tsx)
 npm run check           # typecheck + test
-./verify.sh             # end-to-end against the real provider (costs ~1 cent)
+npm run verify          # self-checks that call no model
+npm run verify:full     # the above plus one real loop (~1 cent)
 npx tsx src/main.ts     # run TypeScript directly, no build
 ```
 

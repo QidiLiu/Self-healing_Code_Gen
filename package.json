@@ -13,7 +13,9 @@
     "dev": "tsc && node dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test src/__tests__/*.test.ts",
-    "check": "npm run typecheck && npm run test"
+    "check": "npm run typecheck && npm run test",
+    "verify": "./verify.sh",
+    "verify:full": "./verify.sh --full"
   },
   "dependencies": {
     "@opencode/sdk": "2.0.24"

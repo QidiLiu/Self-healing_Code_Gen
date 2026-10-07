@@ -245,13 +245,16 @@ export async function preflightProvider(
   }
 
   const models = await listModels(client, config.workspacePath)
-  const modelIds = models.map((m) => m.modelID).filter((id): id is string => typeof id === "string")
+  const modelIds = models
+    .filter((m) => m.providerID === providerID)
+    .map((m) => m.modelID)
+    .filter((id): id is string => typeof id === "string")
 
   if (modelIds.length > 0 && !modelIds.includes(modelID)) {
     return {
       ok: false,
       error: `Model "${config.model}" does not exist on provider "${providerID}".`,
-      hint: `Available models: ${modelIds.join(", ")}`,
+      hint: `Available models on "${providerID}": ${modelIds.join(", ")}`,
     }
   }
 

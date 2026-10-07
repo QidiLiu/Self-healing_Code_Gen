@@ -153,9 +153,18 @@ await client.credential.list()
 for await (const item of client.session.log({ sessionID: s.id })) { /* ... */ }
 ```
 
-## 为什么默认模型从 `deepseek-v4-pro` 换成 `deepseek-flash`
+## 为什么默认模型是 `deepseek-flash`
 
-`deepseek-v4-pro` 在 DeepSeek 官方模型列表里不存在，是一个无法使用的配置。
-实测该 provider 下可用的模型是 `deepseek-flash` 与 `deepseek-v4-pro`（后者由聚合层提供）。
-按用户要求改用 `deepseek-flash`：`status=active`、`enabled=true`、context 1M、
-输出上限 393k，计价 $0.15/$0.60 per Mtok。
+该 provider 下实测可用的模型：
+
+| 模型 | 状态 | context | output | 价格 (in/out, USD per Mtok) |
+|------|------|---------|--------|------------------------------|
+| `deepseek-flash` | active, enabled | 1,000,000 | 393,216 | 0.15 / 0.60 |
+| `deepseek-v4-pro` | active, enabled | 1,000,000 | 393,216 | 0.66 / 1.98 |
+
+两个都能用。选 `deepseek-flash` 是按用户要求，它约为 `deepseek-v4-pro` 的 1/4.4 价格，
+对「跑很多轮、每轮都要读一遍工作区」的自愈循环来说更合适。
+
+（早期版本把默认值写成 `deepseek-v4-pro`，那是从模板里抄来的；两个模型都真实存在，
+不存在「模型 id 不存在」的问题。）
+

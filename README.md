@@ -79,6 +79,7 @@
 | `state/usage.json` | 请求数、token、花费累计 |
 | `state/trace.md` | Agent 原始活动（`AGENT_TRACE=1` 开启） |
 | `state/debug/` | JSON 解析失败的原始响应 |
+| `state/reply.json` | CLI / Web 提交的回复指令（被消费后删除） |
 | `state/requirements.bak.md` | 回复指令改写需求前的备份 |
 
 ## 快速开始
@@ -135,7 +136,8 @@ opencode auth list       # 确认显示 stored
 ```bash
 npm start              # 交互模式，跑完等回复，Ctrl+C 退出
 npm start -- --once    # 跑一轮，打印报告，按结果退出 0/1
-npm run verify         # 端到端自检（会真实调用模型，花费几分钱）
+npm run verify         # 自检：20 项不调用模型（预检、参数、仪表盘、回复编辑）
+npm run verify:full    # 自检 + 真实跑一轮循环（花费约 1 分钱）
 ```
 
 ### API Key 解析顺序
@@ -344,15 +346,21 @@ Self-healing_Code_Gen/
 npm run typecheck   # tsc --noEmit
 npm test            # 单元 + 集成测试 (node:test)
 npm run check       # 两者都跑
-./verify.sh         # 端到端：真实调用模型，断言状态文件产物
+npm run verify      # 自检，不调用模型
+npm run verify:full # 自检 + 真实跑一轮循环
 ```
 
 测试覆盖状态机跃迁的穷举、回复指令的块级编辑与事务性、LLM JSON 解析、
 评估结果的交叉校验、API Key 解析，以及用桩客户端驱动的完整循环
 （含「崩溃后从 fixing 恢复，不重新规划」和「坏 API key 不消耗重试预算」）。
 
-`verify.sh` 会真实调用 provider（花费约 1 分钱），断言 `checkpoint.json` /
-`usage.json` / `report.*` 都已生成、迭代预算被遵守、阶段是终态，且没有基础设施失败。
+`verify.sh` 默认跑 20 项**不调用模型**的检查：环境与 CLI 版本、
+未知参数与非法模型、provider 预检的失败路径、三个角色 agent 是否都写入
+`opencode.json`、仪表盘的路径穿越与监听地址、回复指令的块级编辑与拒绝逻辑。
+
+加 `--full` 才真实调用 provider（花费约 1 分钱），额外断言
+`checkpoint.json` / `usage.json` / `report.*` 都已生成、迭代预算被遵守、
+阶段是终态，且没有基础设施失败。
 
 ## 设计原则
 
