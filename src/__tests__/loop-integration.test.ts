@@ -4,9 +4,12 @@ import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
 
-import { runAgentLoop } from "../loop.js"
+import { runAgentLoop, setBackoffScale } from "../loop.js"
 import { loadConfig } from "../config.js"
 import { AgentConfig } from "../types.js"
+
+// Provider failures back off for 5s; the tests below deliberately trigger them.
+setBackoffScale(0)
 
 const PLANNER_ITEMS = Array.from({ length: 3 }, (_, i) => ({
   id: `ITEM-00${i + 1}`,
@@ -15,70 +18,90 @@ const PLANNER_ITEMS = Array.from({ length: 3 }, (_, i) => ({
   testableAssertion: `assertion ${i + 1}`,
 }))
 
-function textResponse(text: string, cost = 0.01) {
+function assistantMessage(text: string, cost = 0.02) {
   return {
-    data: {
-      info: {
-        id: "msg_1",
-        error: undefined,
-        cost,
-        tokens: { input: 10, output: 5, cache: { read: 0, write: 0 } },
-      },
-      parts: [{ type: "text", text }],
-    },
+    id: "msg_1",
+    type: "assistant",
+    content: [{ type: "text", text }],
+    cost,
+    tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
   }
 }
 
-function evaluatorResponse(body: Record<string, unknown>) {
-  return textResponse(JSON.stringify({ phase: "evaluation", summary: "stub", ...body }), 0.02)
+function promptResponse(data: unknown) {
+  return { data }
 }
 
-/** Routes each prompt to the role that owns it, by inspecting the prompt text. */
+/**
+ * A stub of the opencode v2 host surface used by the loop.
+ *
+ * v2's `sessions.prompt()` only enqueues a turn; the reply comes back from
+ * `message.list()`. The stub mirrors that so the loop's read path is exercised.
+ */
 function makeStubClient(
   overrides: {
-    planner?: () => Promise<unknown>
-    evaluator?: () => Promise<unknown>
+    planner?: () => string
+    generator?: () => string
+    evaluator?: () => unknown
   } = {},
 ) {
   let sessionCounter = 0
-  const calls = { planner: 0, generator: 0, evaluator: 0 }
+  const calls = { planner: 0, generator: 0, evaluator: 0, create: 0 }
+
+  const promptTexts: string[] = []
 
   const client = {
-    session: {
-      create: async () => {
+    sessions: {
+      create: async (input: { title?: string }) => {
+        calls.create++
         sessionCounter++
-        return { data: { id: `ses_${sessionCounter}` } }
+        return { id: `ses_${sessionCounter}`, ...input }
       },
-      prompt: async (args: unknown) => {
-        const prompt = (args as { body: { parts: { text: string }[] } }).body.parts[0].text
+      prompt: async (input: { sessionID: string; text: string }) => {
+        const text = input.text
+        promptTexts.push(text)
 
-        if (prompt.includes("ITEMS TO VERIFY")) {
+        if (text.includes("ITEMS TO VERIFY")) {
           calls.evaluator++
-          if (overrides.evaluator) return overrides.evaluator()
-          return evaluatorResponse({
-            allPass: false,
-            passedCount: 2,
-            failedCount: 1,
-            totalCount: 3,
-            failures: [
-              {
-                itemId: "ITEM-003",
-                description: "not implemented",
-                errorDetail: "missing feature",
-                severity: "high",
-              },
-            ],
+          return promptResponse({
+            id: "user_msg",
+            type: "user",
+            payload: { text },
           })
         }
-
-        if (prompt.includes("REQUIREMENTS:") || prompt.includes("EVALUATION FAILURES")) {
+        if (text.includes("REQUIREMENTS:") || text.includes("EVALUATION FAILURES")) {
           calls.planner++
-          if (overrides.planner) return overrides.planner()
-          return textResponse(JSON.stringify({ overview: "stub project", items: PLANNER_ITEMS }))
+          const body = overrides.planner
+            ? overrides.planner()
+            : JSON.stringify({ overview: "stub project", items: PLANNER_ITEMS })
+          return promptResponse({ id: "user_msg", type: "user", payload: { text: body } })
         }
 
         calls.generator++
-        return textResponse("Wrote the implementation.")
+        return promptResponse({ id: "user_msg", type: "user", payload: { text } })
+      },
+      wait: async () => undefined,
+    },
+    message: {
+      list: async () => {
+        const text = promptTexts[promptTexts.length - 1] ?? ""
+
+        if (text.includes("ITEMS TO VERIFY")) {
+          return {
+            data: overrides.evaluator ? [overrides.evaluator()] : [assistantMessage("eval")],
+          }
+        }
+
+        const body =
+          text.includes("REQUIREMENTS:") || text.includes("EVALUATION FAILURES")
+            ? overrides.planner
+              ? overrides.planner()
+              : JSON.stringify({ overview: "stub project", items: PLANNER_ITEMS })
+            : overrides.generator
+              ? overrides.generator()
+              : "wrote the code"
+
+        return { data: [assistantMessage(body)] }
       },
     },
   }
@@ -120,6 +143,59 @@ function readCheckpoint(rootDir: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(rootDir, "state", "checkpoint.json"), "utf-8"))
 }
 
+const ONE_FAILURE = {
+  id: "msg_eval",
+  type: "assistant",
+  content: [
+    {
+      type: "text",
+      text: JSON.stringify({
+        phase: "evaluation",
+        allPass: false,
+        passedCount: 2,
+        failedCount: 1,
+        totalCount: 3,
+        failures: [
+          { itemId: "ITEM-003", description: "not implemented", errorDetail: "missing feature", severity: "high" },
+        ],
+        summary: "one item failing",
+      }),
+    },
+  ],
+  cost: 0.02,
+  tokens: { input: 20, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+}
+
+const PROVIDER_FAILURE = {
+  id: "msg_eval",
+  type: "assistant",
+  content: [],
+  cost: 0,
+  tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  error: { type: "provider.auth", message: "invalid api key", status: 403 },
+}
+
+const ALL_PASS = {
+  id: "msg_eval",
+  type: "assistant",
+  content: [
+    {
+      type: "text",
+      text: JSON.stringify({
+        phase: "evaluation",
+        allPass: true,
+        passedCount: 3,
+        failedCount: 0,
+        totalCount: 3,
+        failures: [],
+        summary: "all good",
+      }),
+    },
+  ],
+  cost: 0.02,
+  tokens: { input: 20, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+}
+
 describe("runAgentLoop termination", () => {
   it("reaches stuck after exactly maxReplans replans", async () => {
     await withProject(async (rootDir) => {
@@ -128,7 +204,7 @@ describe("runAgentLoop termination", () => {
         maxReplans: 2,
         maxTotalIterations: 50,
       })
-      const { client, calls } = makeStubClient()
+      const { client, calls } = makeStubClient({ evaluator: () => ONE_FAILURE })
 
       const report = await runAgentLoop(client as never, config)
 
@@ -145,8 +221,13 @@ describe("runAgentLoop termination", () => {
         `ran ${checkpoint.iterations} iterations, budget was 50`,
       )
 
+      // maxRetries=2 means 3 evaluations per plan (retries 0,1,2), and the
+      // generator runs once per evaluation.
       assert.equal(calls.planner, 3, "1 initial plan + 2 replans")
-      assert.equal(calls.generator, 9, "3 evaluations worth of fixes")
+      assert.equal(calls.evaluator, 9, "3 plans x 3 evaluations")
+      assert.equal(calls.generator, 9)
+      // planner rotates per replan (3), generator and evaluator are reused.
+      assert.equal(calls.create, 3 + 1 + 1, "3 planner + 1 generator + 1 evaluator")
     })
   })
 
@@ -157,7 +238,7 @@ describe("runAgentLoop termination", () => {
         maxReplans: 10,
         maxTotalIterations: 4,
       })
-      const { client } = makeStubClient()
+      const { client } = makeStubClient({ evaluator: () => ONE_FAILURE })
 
       const report = await runAgentLoop(client as never, config)
 
@@ -179,27 +260,14 @@ describe("runAgentLoop termination", () => {
         maxTotalIterations: 100,
       })
 
-      const { client } = makeStubClient({
-        evaluator: async () => ({
-          data: {
-            info: {
-              id: "m",
-              error: {
-                name: "ProviderAuthError",
-                data: { providerID: "test", message: "invalid api key" },
-              },
-              cost: 0,
-              tokens: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-            },
-            parts: [],
-          },
-        }),
-      })
+      const { client } = makeStubClient({ evaluator: () => PROVIDER_FAILURE })
 
       const report = await runAgentLoop(client as never, config)
 
       assert.equal(report.phase, "stuck")
       assert.match(report.blockingIssue ?? "", /Model\/provider unavailable/i)
+      assert.match(report.blockingIssue ?? "", /invalid api key/)
+      assert.match(report.blockingIssue ?? "", /403/)
 
       const checkpoint = readCheckpoint(rootDir)
       assert.equal(checkpoint.infraErrors, 2)
@@ -220,16 +288,7 @@ describe("runAgentLoop termination", () => {
   it("reports done when every contract item passes", async () => {
     await withProject(async (rootDir) => {
       const config = makeConfig(rootDir)
-      const { client } = makeStubClient({
-        evaluator: async () =>
-          evaluatorResponse({
-            allPass: true,
-            passedCount: 3,
-            failedCount: 0,
-            totalCount: 3,
-            failures: [],
-          }),
-      })
+      const { client } = makeStubClient({ evaluator: () => ALL_PASS })
 
       const report = await runAgentLoop(client as never, config)
 
@@ -243,14 +302,14 @@ describe("runAgentLoop termination", () => {
   it("records cost and tokens across the run", async () => {
     await withProject(async (rootDir) => {
       const config = makeConfig(rootDir)
-      const { client } = makeStubClient()
+      const { client } = makeStubClient({ evaluator: () => ALL_PASS })
 
       await runAgentLoop(client as never, config)
 
       const usage = JSON.parse(
         fs.readFileSync(path.join(rootDir, "state", "usage.json"), "utf-8"),
       )
-      assert.ok(usage.requests > 0, "expected at least one request")
+      assert.equal(usage.requests, 3, "planner + generator + evaluator")
       assert.ok(usage.input > 0)
       assert.ok(usage.cost > 0)
     })
@@ -273,9 +332,9 @@ describe("runAgentLoop termination", () => {
           parseErrors: 0,
           errors: [],
           lastError: null,
-          plannerSessionId: "ses_old",
-          generatorSessionId: "ses_old",
-          evaluatorSessionId: "ses_old",
+          plannerSessionId: null,
+          generatorSessionId: null,
+          evaluatorSessionId: null,
           updatedAt: new Date().toISOString(),
         }),
       )
@@ -297,19 +356,14 @@ describe("runAgentLoop termination", () => {
           failedCount: 1,
           totalCount: 3,
           failures: [
-            {
-              itemId: "ITEM-003",
-              description: "still broken",
-              errorDetail: "detail restored from disk",
-              severity: "high",
-            },
+            { itemId: "ITEM-003", description: "still broken", errorDetail: "restored from disk", severity: "high" },
           ],
           summary: "restored",
         }),
       )
 
       const config = makeConfig(rootDir, { maxRetries: 2, maxReplans: 0, maxTotalIterations: 20 })
-      const { client, calls } = makeStubClient()
+      const { client, calls } = makeStubClient({ evaluator: () => ONE_FAILURE })
 
       const report = await runAgentLoop(client as never, config)
 
@@ -318,6 +372,24 @@ describe("runAgentLoop termination", () => {
       assert.equal(calls.evaluator, 2)
       assert.equal(report.phase, "stuck")
       assert.ok(report.failures.some((f) => f.itemId === "ITEM-003"))
+    })
+  })
+
+  it("keeps each role in its own session", async () => {
+    await withProject(async (rootDir) => {
+      const config = makeConfig(rootDir)
+      const { client } = makeStubClient({ evaluator: () => ALL_PASS })
+
+      await runAgentLoop(client as never, config)
+
+      // planner, generator, evaluator: three distinct sessions.
+      const checkpoint = readCheckpoint(rootDir)
+      const ids = [
+        checkpoint.plannerSessionId,
+        checkpoint.generatorSessionId,
+        checkpoint.evaluatorSessionId,
+      ]
+      assert.equal(new Set(ids).size, 3, `expected 3 distinct sessions, got ${ids.join(",")}`)
     })
   })
 })

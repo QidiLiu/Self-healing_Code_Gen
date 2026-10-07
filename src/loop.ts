@@ -1,4 +1,3 @@
-import { OpencodeClient } from "@opencode-ai/sdk"
 import {
   AgentConfig,
   AgentPhase,
@@ -6,6 +5,8 @@ import {
   Checkpoint,
   Contract,
   EvaluationResult,
+  RoleName,
+  RoleSpec,
 } from "./types.js"
 import {
   loadCheckpoint,
@@ -23,6 +24,9 @@ import {
   createSession,
   describeError,
   EmptyResponseError,
+  InterruptedError,
+  isShutdownRequested,
+  OpencodeClient,
   OpencodeRequestError,
   ProviderError,
   sleep,
@@ -48,7 +52,24 @@ export type PhaseDecision =
 
 const INFRA_BACKOFF_MS = 5000
 const PARSE_BACKOFF_MS = 2000
-const MAX_PARSE_ERRORS = 3
+/** Malformed output is retried this many times before the run is declared stuck. */
+const MAX_PARSE_RETRIES = 2
+const MAX_PARSE_ERRORS = MAX_PARSE_RETRIES + 1
+
+/**
+ * Backoff multiplier for the retrying-failure paths, overridable so tests do not
+ * spend five seconds per provider error.
+ */
+let backoffScale = 1
+
+export function setBackoffScale(scale: number): void {
+  backoffScale = scale
+}
+
+function backoffFor(kind: FailureKind): Promise<void> {
+  const base = kind === "infra" ? INFRA_BACKOFF_MS : PARSE_BACKOFF_MS
+  return sleep(Math.round(base * backoffScale))
+}
 
 /**
  * The whole phase transition policy, with no IO in it.
@@ -93,7 +114,11 @@ interface RoleFailure {
  * Infra and parse failures must never be charged against the code retry budget,
  * otherwise a bad API key or a malformed response looks like a stubborn bug.
  */
-function classifyFailure(err: unknown): RoleFailure {
+function classifyFailure(err: unknown): RoleFailure | null {
+  // A shutdown is neither a code bug nor a provider problem; the loop should
+  // just stop.
+  if (err instanceof InterruptedError) return null
+
   if (
     err instanceof OpencodeRequestError ||
     err instanceof ProviderError ||
@@ -115,14 +140,17 @@ function classifyFailure(err: unknown): RoleFailure {
 
 async function guardRoleCall<T>(
   config: AgentConfig,
-  role: string,
+  role: RoleName,
   label: string,
   fn: () => Promise<T>,
-): Promise<{ ok: true; value: T } | { ok: false; failure: RoleFailure }> {
+): Promise<{ ok: true; value: T } | { ok: false; failure: RoleFailure } | { ok: false; interrupted: true }> {
   try {
     return { ok: true, value: await fn() }
   } catch (err: unknown) {
     const failure = classifyFailure(err)
+    if (!failure) {
+      return { ok: false, interrupted: true }
+    }
     appendError(config.stateDir, {
       timestamp: new Date().toISOString(),
       role,
@@ -133,7 +161,7 @@ async function guardRoleCall<T>(
     appendLog(config.stateDir, {
       timestamp: new Date().toISOString(),
       phase: "idle",
-      role: role as "planner" | "generator" | "evaluator",
+      role,
       action: failure.kind === "infra" ? "infra_error" : "parse_error",
       detail: `[${label}] ${failure.message}`,
     })
@@ -142,8 +170,6 @@ async function guardRoleCall<T>(
 }
 
 interface FailureOutcome {
-  /** Phase to continue in. Stays the same on a retryable failure. */
-  retryPhase: AgentPhase
   retry: boolean
   blocked: string | null
 }
@@ -170,7 +196,6 @@ function applyFailure(
         `Model/provider unavailable ${checkpoint.infraErrors} times in a row. Marking as stuck.`,
       )
       return {
-        retryPhase: "stuck",
         retry: false,
         blocked: `Model/provider unavailable: ${failure.message}.${hint}`,
       }
@@ -179,7 +204,7 @@ function applyFailure(
       currentPhase,
       `Model/provider error (${checkpoint.infraErrors}/${limits.maxInfraErrors}): ${failure.message}`,
     )
-    return { retryPhase: currentPhase, retry: true, blocked: null }
+    return { retry: true, blocked: null }
   }
 
   checkpoint.parseErrors++
@@ -189,13 +214,21 @@ function applyFailure(
       `Malformed model output ${checkpoint.parseErrors} times in a row. Marking as stuck.`,
     )
     return {
-      retryPhase: "stuck",
       retry: false,
       blocked: `Model output could not be parsed: ${failure.message}`,
     }
   }
-  printProgress(currentPhase, `Malformed model output, retrying (${checkpoint.parseErrors}/${MAX_PARSE_ERRORS})`)
-  return { retryPhase: currentPhase, retry: true, blocked: null }
+  printProgress(
+    currentPhase,
+    `Malformed model output, retrying (${checkpoint.parseErrors}/${MAX_PARSE_ERRORS})`,
+  )
+  return { retry: true, blocked: null }
+}
+
+export interface RoleRegistry {
+  planner: RoleSpec
+  generator: RoleSpec
+  evaluator: RoleSpec
 }
 
 export async function runAgentLoop(
@@ -227,6 +260,45 @@ export async function runAgentLoop(
   }
 
   const requirements = fs.readFileSync(config.requirementsPath, "utf-8")
+
+  const model = {
+    id: config.model.includes("/") ? config.model.slice(config.model.indexOf("/") + 1) : config.model,
+    providerID: config.model.includes("/") ? config.model.slice(0, config.model.indexOf("/")) : "opencode",
+  }
+
+  /**
+   * A role bound to a lazily created session.
+   *
+   * Session ids are not persisted across processes: v2 sessions live inside one
+   * host, so a stored id from a previous run cannot be reused. The replan path
+   * clears the id to force a fresh session, which is why it is writable.
+   */
+  const makeRole = (name: RoleName): RoleSpec => {
+    const spec: RoleSpec = {
+      name,
+      client,
+      sessionId: "",
+      newSession: async (title: string) =>
+        createSession(client, title, config.workspacePath, model, name),
+    }
+    return spec
+  }
+
+  const roles: RoleRegistry = {
+    planner: makeRole("planner"),
+    generator: makeRole("generator"),
+    evaluator: makeRole("evaluator"),
+  }
+
+  const ensureSession = async (spec: RoleSpec, title: string): Promise<void> => {
+    if (!spec.sessionId) {
+      spec.sessionId = await spec.newSession(title)
+    }
+  }
+
+  checkpoint.plannerSessionId = null
+  checkpoint.generatorSessionId = null
+  checkpoint.evaluatorSessionId = null
 
   appendLog(config.stateDir, {
     timestamp: new Date().toISOString(),
@@ -268,15 +340,13 @@ export async function runAgentLoop(
 
         printProgress("planning", "Analyzing requirements and creating contract...")
 
-        const plannerSessionId =
-          checkpoint.plannerSessionId ||
-          (await createSession(client, "Planner Session", config.workspacePath))
-        checkpoint.plannerSessionId = plannerSessionId
+        await ensureSession(roles.planner, "Planner Session")
+        checkpoint.plannerSessionId = roles.planner.sessionId
 
         const outcome = await guardRoleCall(config, "planner", "runPlanner", () =>
           runPlanner(
-            client,
-            plannerSessionId,
+            roles.planner,
+            contract,
             requirements,
             config,
             isReplan ? checkpoint.errors.join("\n---\n") : undefined,
@@ -284,11 +354,19 @@ export async function runAgentLoop(
         )
 
         if (!outcome.ok) {
+          if ("interrupted" in outcome) {
+            blocked = "Interrupted by shutdown."
+            checkpoint.phase = "stuck"
+            break
+          }
           const failure = applyFailure(checkpoint, outcome.failure, "planning", limits)
-          if (!failure.retry) blocked = failure.blocked
-          checkpoint.phase = failure.retryPhase
+          if (!failure.retry) {
+            blocked = failure.blocked
+            checkpoint.phase = "stuck"
+          } else {
+            await backoffFor(outcome.failure.kind)
+          }
           saveCheckpoint(config.stateDir, checkpoint)
-          if (failure.retry) await sleep(infraOrParseDelay(outcome.failure.kind))
           break
         }
 
@@ -327,15 +405,12 @@ export async function runAgentLoop(
           break
         }
 
-        const generatorSessionId =
-          checkpoint.generatorSessionId ||
-          (await createSession(client, "Generator Session", config.workspacePath))
-        checkpoint.generatorSessionId = generatorSessionId
+        await ensureSession(roles.generator, "Generator Session")
+        checkpoint.generatorSessionId = roles.generator.sessionId
 
         const outcome = await guardRoleCall(config, "generator", "runGenerator", () =>
           runGenerator(
-            client,
-            generatorSessionId,
+            roles.generator,
             contract!,
             config,
             fixing ? evaluation || undefined : undefined,
@@ -343,11 +418,19 @@ export async function runAgentLoop(
         )
 
         if (!outcome.ok) {
+          if ("interrupted" in outcome) {
+            blocked = "Interrupted by shutdown."
+            checkpoint.phase = "stuck"
+            break
+          }
           const failure = applyFailure(checkpoint, outcome.failure, checkpoint.phase, limits)
-          if (!failure.retry) blocked = failure.blocked
-          checkpoint.phase = failure.retryPhase
+          if (!failure.retry) {
+            blocked = failure.blocked
+            checkpoint.phase = "stuck"
+          } else {
+            await backoffFor(outcome.failure.kind)
+          }
           saveCheckpoint(config.stateDir, checkpoint)
-          if (failure.retry) await sleep(infraOrParseDelay(outcome.failure.kind))
           break
         }
 
@@ -377,21 +460,27 @@ export async function runAgentLoop(
           break
         }
 
-        const evaluatorSessionId =
-          checkpoint.evaluatorSessionId ||
-          (await createSession(client, "Evaluator Session", config.workspacePath))
-        checkpoint.evaluatorSessionId = evaluatorSessionId
+        await ensureSession(roles.evaluator, "Evaluator Session")
+        checkpoint.evaluatorSessionId = roles.evaluator.sessionId
 
         const outcome = await guardRoleCall(config, "evaluator", "runEvaluator", () =>
-          runEvaluator(client, evaluatorSessionId, contract!, config),
+          runEvaluator(roles.evaluator, contract!, config),
         )
 
         if (!outcome.ok) {
+          if ("interrupted" in outcome) {
+            blocked = "Interrupted by shutdown."
+            checkpoint.phase = "stuck"
+            break
+          }
           const failure = applyFailure(checkpoint, outcome.failure, "evaluating", limits)
-          if (!failure.retry) blocked = failure.blocked
-          checkpoint.phase = failure.retryPhase
+          if (!failure.retry) {
+            blocked = failure.blocked
+            checkpoint.phase = "stuck"
+          } else {
+            await backoffFor(outcome.failure.kind)
+          }
           saveCheckpoint(config.stateDir, checkpoint)
-          if (failure.retry) await sleep(infraOrParseDelay(outcome.failure.kind))
           break
         }
 
@@ -429,6 +518,8 @@ export async function runAgentLoop(
             checkpoint.phase = "replanning"
             checkpoint.replanCount++
             checkpoint.retries = 0
+            // runPlanner rotates its own session on a replan; clearing it here
+            // too would just allocate a throwaway session.
           } else {
             printProgress("evaluating", decision.reason)
             blocked = decision.reason
@@ -463,17 +554,11 @@ export async function runAgentLoop(
       `Iterations: ${checkpoint.iterations}, retries: ${checkpoint.retries}, replans: ${checkpoint.replanCount}.`,
   })
 
-  const report = generateReport(
+  return generateReport(
     checkpoint,
     contract || undefined,
     evaluation || undefined,
     config,
     blocked,
   )
-
-  return report
-}
-
-function infraOrParseDelay(kind: FailureKind): number {
-  return kind === "infra" ? INFRA_BACKOFF_MS : PARSE_BACKOFF_MS
 }

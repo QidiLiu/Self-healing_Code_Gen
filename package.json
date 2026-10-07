@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "description": "Self-healing autonomous agent system with planner, generator, and evaluator roles",
   "main": "dist/main.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/main.js",
@@ -13,7 +16,7 @@
     "check": "npm run typecheck && npm run test"
   },
   "dependencies": {
-    "@opencode-ai/sdk": "^1.0.0"
+    "@opencode/sdk": "2.0.24"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

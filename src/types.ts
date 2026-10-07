@@ -1,3 +1,5 @@
+import type { OpencodeClient } from "./opencode.js"
+
 export type AgentPhase =
   | "idle"
   | "planning"
@@ -7,6 +9,22 @@ export type AgentPhase =
   | "replanning"
   | "done"
   | "stuck"
+
+export type RoleName = "planner" | "generator" | "evaluator"
+
+/**
+ * A role bound to its opencode session.
+ *
+ * `sessionId` is mutable because a replan needs a fresh planner session: keeping
+ * the old one would leave the previous plan in context and anchor the model into
+ * reproducing it.
+ */
+export interface RoleSpec {
+  name: RoleName
+  client: OpencodeClient
+  sessionId: string
+  newSession: (title: string) => Promise<string>
+}
 
 export interface Checkpoint {
   phase: AgentPhase
@@ -110,7 +128,6 @@ export interface AgentConfig {
   /** Why key resolution failed, if it did. */
   apiKeyError: string | null
   baseUrl: string | null
-  serverPort: number
   maxRetries: number
   maxReplans: number
   maxInfraErrors: number

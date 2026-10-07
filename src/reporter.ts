@@ -1,5 +1,6 @@
 import { AgentConfig, Checkpoint, Contract, EvaluationResult, AgentReport, AgentPhase } from "./types.js"
 import { loadUsage } from "./state.js"
+import { traceSummary } from "./trace.js"
 import * as fs from "fs"
 import * as path from "path"
 
@@ -128,11 +129,19 @@ function saveReportFile(report: AgentReport, config: AgentConfig): void {
   md += `Requests: ${usage.requests}, cost: ${usage.cost.toFixed(4)}, ` +
     `tokens in/out: ${usage.input}/${usage.output}\n\n`
 
+  const trace = traceSummary(config.stateDir)
+  if (trace) {
+    md += `Agent trace: ${trace.lines} entries (${trace.bytes} bytes)\n\n`
+  }
+
   md += `## Files\n\n`
   md += `- Contract: \`${path.join(config.stateDir, "contract.md")}\`\n`
   md += `- Progress: \`${path.join(config.stateDir, "progress.md")}\`\n`
   md += `- Log: \`${report.logPath}\`\n`
   md += `- Errors: \`${path.join(config.stateDir, "errors.jsonl")}\`\n`
+  if (trace) {
+    md += `- Trace: \`${path.join(config.stateDir, "trace.md")}\` (enable with AGENT_TRACE=1)\n`
+  }
 
   fs.writeFileSync(path.join(reportDir, "report.md"), md)
 

@@ -1,7 +1,7 @@
-import { OpencodeClient } from "@opencode-ai/sdk"
-import { sendPrompt } from "../opencode.js"
 import { Contract, AgentConfig, EvaluationResult } from "../types.js"
+import { sendPrompt, PromptResult, RoleAgent } from "../opencode.js"
 import { appendLog, loadPrinciplesFile, recordUsage } from "../state.js"
+import { traceSinkFor } from "../trace.js"
 
 const GENERATOR_SYSTEM_PROMPT = `You are a Code Generator. Your sole job is to IMPLEMENT software according to a contract.
 
@@ -17,7 +17,7 @@ CRITICAL RULES:
 9. After writing code, ALWAYS try to build and run it to verify basic functionality.
 10. If the build or tests fail, fix the code based on the error messages.
 
-WORKSPACE: The workspace is at the "workspace/" directory. This is where you create the user's project.
+WORKSPACE: The workspace is the directory this session is rooted at. This is where you create the user's project.
 Write ALL code inside that directory. Create subdirectories as needed.
 
 IMPORTANT: For web applications, create a self-contained HTML file (or minimal project) that can be opened directly in a browser. Use plain HTML/CSS/JS unless the contract specifies otherwise.
@@ -43,19 +43,46 @@ CRITICAL RULES:
 
 The evaluation failures are provided below. Fix them one at a time.`
 
+export const GENERATOR_AGENT: RoleAgent = "generator"
+
+export function generatorSystemPrompt(config: AgentConfig): string {
+  const sections = [GENERATOR_SYSTEM_PROMPT]
+
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
+  if (loopPrinciples) {
+    sections.push(`--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`)
+  }
+
+  const codingPrinciples = loadPrinciplesFile("CODING_PRINCIPLES.md", config.rootDir)
+  if (codingPrinciples) {
+    sections.push(`--- CODING PRINCIPLES (follow these strictly) ---\n${codingPrinciples}`)
+  }
+
+  return sections.join("\n\n")
+}
+
+export function generatorFixSystemPrompt(config: AgentConfig): string {
+  const sections = [GENERATOR_FIX_SYSTEM_PROMPT]
+
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
+  if (loopPrinciples) {
+    sections.push(`--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`)
+  }
+
+  const codingPrinciples = loadPrinciplesFile("CODING_PRINCIPLES.md", config.rootDir)
+  if (codingPrinciples) {
+    sections.push(`--- CODING PRINCIPLES (follow these strictly) ---\n${codingPrinciples}`)
+  }
+
+  return sections.join("\n\n")
+}
+
 export async function runGenerator(
-  client: OpencodeClient,
-  sessionId: string,
+  spec: { client: import("../opencode.js").OpencodeClient; sessionId: string },
   contract: Contract,
   config: AgentConfig,
   evaluation?: EvaluationResult,
 ): Promise<string> {
-  const model = {
-    providerID: config.model.split("/")[0],
-    modelID: config.model.split("/").slice(1).join("/"),
-  }
-
-  let systemPrompt: string
   let userPrompt: string
 
   if (evaluation && evaluation.failures.length > 0) {
@@ -66,7 +93,6 @@ export async function runGenerator(
       )
       .join("\n\n")
 
-    systemPrompt = GENERATOR_FIX_SYSTEM_PROMPT
     userPrompt = `CONTRACT:\nThe contract has ${contract.items.length} items to implement.\n\nFAILURES TO FIX:\n${failureList}\n\nFix these specific failures. Do NOT modify code that is not related to these failures.`
   } else {
     const contractText = contract.items
@@ -76,20 +102,17 @@ export async function runGenerator(
       )
       .join("\n\n")
 
-    systemPrompt = GENERATOR_SYSTEM_PROMPT
     userPrompt = `CONTRACT - ${contract.overview}\n\nImplement the following requirements:\n\n${contractText}\n\nBuild the complete implementation in the workspace/ directory.`
   }
 
-  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
-  if (loopPrinciples) {
-    systemPrompt += `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
-  }
-  const codingPrinciples = loadPrinciplesFile("CODING_PRINCIPLES.md", config.rootDir)
-  if (codingPrinciples) {
-    systemPrompt += `\n\n--- CODING PRINCIPLES (follow these strictly) ---\n${codingPrinciples}`
-  }
-
-  const result = await sendPrompt(client, sessionId, systemPrompt, userPrompt, model, config.workspacePath)
+  const result: PromptResult = await sendPrompt({
+    client: spec.client,
+    sessionId: spec.sessionId,
+    text: userPrompt,
+    directory: config.workspacePath,
+    label: "generator",
+    onTrace: traceSinkFor(config, "generator"),
+  })
   recordUsage(config.stateDir, { ...result.usage, requests: 1 })
 
   appendLog(config.stateDir, {

@@ -61,7 +61,7 @@ function iniInt(value: string | undefined): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-export function resolveApiKey(args: {
+function resolveApiKey(args: {
   apiKey?: string
   apiKeyEnv?: string
   keyFile?: string
@@ -103,6 +103,11 @@ export function resolveApiKey(args: {
   return { apiKey: "", source: "", error: "" }
 }
 
+/**
+ * The API key is optional here: credentials registered through
+ * `opencode auth login` live in the shared SQLite database and are picked up by
+ * the host without the project ever holding the secret.
+ */
 export function loadConfig(args: {
   requirements?: string
   workspace?: string
@@ -113,7 +118,6 @@ export function loadConfig(args: {
   apiKeyEnv?: string
   keyFile?: string
   baseUrl?: string
-  serverPort?: number
   maxRetries?: number
   maxReplans?: number
   maxInfraErrors?: number
@@ -122,7 +126,7 @@ export function loadConfig(args: {
   const root = process.cwd()
   const ini = loadIniConfig(root)
 
-  const model = args.model || ini.model?.provider_model || "deepseek/deepseek-v4-pro"
+  const model = args.model || ini.model?.provider_model || "deepseek/deepseek-flash"
   const parsedModel = parseModel(model)
 
   const keyFile = args.keyFile || path.join(root, "doc", "DEEPSEEK_KEY.md")
@@ -162,7 +166,6 @@ export function loadConfig(args: {
     apiKeySource: resolution.source,
     apiKeyError: resolution.error || null,
     baseUrl: args.baseUrl || ini.model?.base_url || null,
-    serverPort: args.serverPort || iniInt(ini.model?.server_port) || 4096,
     maxRetries,
     maxReplans,
     maxInfraErrors,

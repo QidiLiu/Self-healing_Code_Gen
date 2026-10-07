@@ -1,7 +1,7 @@
-import { OpencodeClient } from "@opencode-ai/sdk"
-import { sendPrompt } from "../opencode.js"
-import { Contract, ContractItem, AgentConfig } from "../types.js"
+import { Contract, ContractItem, AgentConfig, RoleSpec } from "../types.js"
+import { sendPrompt, PromptResult, OpencodeClient } from "../opencode.js"
 import { appendLog, loadPrinciplesFile, recordUsage } from "../state.js"
+import { traceSinkFor } from "../trace.js"
 import { parseLLMJson, saveParseDebug } from "../json-parser.js"
 
 const PLANNER_SYSTEM_PROMPT = `You are a Technical Architect specializing in requirement decomposition.
@@ -92,12 +92,12 @@ function validateContractData(parsed: Record<string, unknown>): {
   warning?: string
 } {
   if (!isNonEmptyString(parsed.overview)) {
-    return { contract: null, error: "missing non-empty \"overview\"" }
+    return { contract: null, error: 'missing non-empty "overview"' }
   }
 
   const rawItems = parsed.items
   if (!Array.isArray(rawItems) || rawItems.length < MIN_ITEMS) {
-    return { contract: null, error: "\"items\" must be a non-empty array" }
+    return { contract: null, error: '"items" must be a non-empty array' }
   }
 
   const items: ContractItem[] = []
@@ -171,38 +171,64 @@ function parseContractFromText(text: string): {
   return validateContractData(parseResult.data)
 }
 
+/**
+ * The system prompt for the planner role. Declared as an opencode agent so the
+ * role identity lives in opencode.json rather than being prepended to every
+ * user turn (v2's sessions.prompt has no system field).
+ */
+export function plannerSystemPrompt(config: AgentConfig): string {
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
+  if (!loopPrinciples) return PLANNER_SYSTEM_PROMPT
+  return (
+    PLANNER_SYSTEM_PROMPT +
+    `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
+  )
+}
+
+export function plannerReplanSystemPrompt(config: AgentConfig): string {
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
+  if (!loopPrinciples) return PLANNER_REPLAN_SYSTEM_PROMPT
+  return (
+    PLANNER_REPLAN_SYSTEM_PROMPT +
+    `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
+  )
+}
+
 export async function runPlanner(
-  client: OpencodeClient,
-  sessionId: string,
+  spec: RoleSpec,
+  contract: Contract | null,
   requirements: string,
   config: AgentConfig,
   failures?: string,
 ): Promise<Contract> {
-  const model = {
-    providerID: config.model.split("/")[0],
-    modelID: config.model.split("/").slice(1).join("/"),
-  }
-
   const isReplan = failures !== undefined
+  const phase: "planning" | "replanning" = isReplan ? "replanning" : "planning"
+  const action = isReplan ? "replan" : "plan"
 
-  let systemPrompt = isReplan
-    ? PLANNER_REPLAN_SYSTEM_PROMPT
-    : PLANNER_SYSTEM_PROMPT
   const userPrompt = isReplan
     ? `ORIGINAL REQUIREMENTS:\n${requirements}\n\nEVALUATION FAILURES (why the previous implementation failed):\n${failures}\n\nProduce an updated contract addressing these failures.`
     : `REQUIREMENTS:\n${requirements}\n\nProduce a testable contract for this project.`
 
-  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
-  if (loopPrinciples) {
-    systemPrompt += `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
+  const ask = async (prompt: string): Promise<PromptResult> => {
+    const result = await sendPrompt({
+      client: spec.client,
+      sessionId: spec.sessionId,
+      text: prompt,
+      directory: config.workspacePath,
+      label: "planner",
+      onTrace: traceSinkFor(config, "planner"),
+    })
+    recordUsage(config.stateDir, { ...result.usage, requests: 1 })
+    return result
   }
 
-  const phase: "planning" | "replanning" = isReplan ? "replanning" : "planning"
-  const action = isReplan ? "replan" : "plan"
+  // A replan runs on a fresh session so the previous plan's context does not
+  // anchor the model into repeating it.
+  if (isReplan) {
+    spec.sessionId = await spec.newSession("Planner (replan)")
+  }
 
-  let result = await sendPrompt(client, sessionId, systemPrompt, userPrompt, model, config.workspacePath)
-  recordUsage(config.stateDir, { ...result.usage, requests: 1 })
-
+  let result = await ask(userPrompt)
   let parsed = parseContractFromText(result.text)
   let attempts = 0
   let lastRawText = result.text
@@ -231,8 +257,7 @@ export async function runPlanner(
       `{"overview": "...", "items": [{"id": "ITEM-001", "description": "...", ` +
       `"category": "ui|logic|validation|integration|testing", "testableAssertion": "..."}]}`
 
-    result = await sendPrompt(client, sessionId, systemPrompt, repairPrompt, model, config.workspacePath)
-    recordUsage(config.stateDir, { ...result.usage, requests: 1 })
+    result = await ask(repairPrompt)
     lastRawText = result.text
     parsed = parseContractFromText(result.text)
     lastError = parsed.error
@@ -255,5 +280,6 @@ export async function runPlanner(
     )
   }
 
+  void contract
   return parsed.contract
 }

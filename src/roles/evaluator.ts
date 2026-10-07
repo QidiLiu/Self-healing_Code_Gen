@@ -1,7 +1,7 @@
-import { OpencodeClient } from "@opencode-ai/sdk"
-import { sendPrompt } from "../opencode.js"
+import { sendPrompt, PromptResult } from "../opencode.js"
 import { Contract, EvaluationResult, EvaluationFailure, AgentConfig } from "../types.js"
 import { appendLog, loadPrinciplesFile, recordUsage } from "../state.js"
+import { traceSinkFor } from "../trace.js"
 import { parseLLMJson, saveParseDebug } from "../json-parser.js"
 
 const EVALUATOR_SYSTEM_PROMPT = `You are an Evaluator. Your job is to PROVE that the code is BROKEN.
@@ -10,7 +10,7 @@ CRITICAL RULES:
 1. The code IS broken. Your job is to find where and how.
 2. Review the contract. For each contract item, determine if the implementation actually satisfies it.
 3. Be ruthless. Do not give the benefit of the doubt. If something is questionable, flag it.
-4. Check the actual files in the workspace/ directory. Read them, try to run them if applicable.
+4. Check the actual files in the workspace directory. Read them, try to run them if applicable.
 5. Check edge cases, error handling, UX issues, correctness.
 6. For each item, mark it as pass or fail with detailed reasoning.
 7. Never mark everything as passed. If you cannot verify an item, it FAILS.
@@ -125,10 +125,7 @@ export function normalizeEvaluation(
   }
 }
 
-function createFallbackEvaluation(
-  contract: Contract,
-  error: string,
-): EvaluationResult {
+function createFallbackEvaluation(contract: Contract, error: string): EvaluationResult {
   const failures: EvaluationFailure[] = [
     {
       itemId: "PARSE-ERROR",
@@ -155,17 +152,20 @@ function createFallbackEvaluation(
   }
 }
 
+export function evaluatorSystemPrompt(config: AgentConfig): string {
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
+  if (!loopPrinciples) return EVALUATOR_SYSTEM_PROMPT
+  return (
+    EVALUATOR_SYSTEM_PROMPT +
+    `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
+  )
+}
+
 export async function runEvaluator(
-  client: OpencodeClient,
-  sessionId: string,
+  spec: { client: import("../opencode.js").OpencodeClient; sessionId: string },
   contract: Contract,
   config: AgentConfig,
 ): Promise<EvaluationResult> {
-  const model = {
-    providerID: config.model.split("/")[0],
-    modelID: config.model.split("/").slice(1).join("/"),
-  }
-
   const contractText = contract.items
     .map(
       (item) =>
@@ -173,15 +173,18 @@ export async function runEvaluator(
     )
     .join("\n\n")
 
-  const userPrompt = `CONTRACT:\n${contract.overview}\n\nITEMS TO VERIFY (${contract.items.length} items):\n${contractText}\n\nEvaluate the implementation in the workspace/ directory against every contract item. Be thorough and ruthless.`
+  const userPrompt =
+    `CONTRACT:\n${contract.overview}\n\nITEMS TO VERIFY (${contract.items.length} items):\n${contractText}\n\n` +
+    `Evaluate the implementation in the workspace directory against every contract item. Be thorough and ruthless.`
 
-  let systemPrompt = EVALUATOR_SYSTEM_PROMPT
-  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
-  if (loopPrinciples) {
-    systemPrompt += `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
-  }
-
-  const result = await sendPrompt(client, sessionId, systemPrompt, userPrompt, model, config.workspacePath)
+  const result: PromptResult = await sendPrompt({
+    client: spec.client,
+    sessionId: spec.sessionId,
+    text: userPrompt,
+    directory: config.workspacePath,
+    label: "evaluator",
+    onTrace: traceSinkFor(config, "evaluator"),
+  })
   recordUsage(config.stateDir, { ...result.usage, requests: 1 })
 
   appendLog(config.stateDir, {
