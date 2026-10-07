@@ -346,6 +346,7 @@ a:hover { text-decoration: underline; }
     <span id="h-model">Model: —</span>
     <span id="h-retries">Retries: —</span>
     <span id="h-replans">Replans: —</span>
+    <span id="h-usage">Cost: —</span>
   </div>
 </div>
 
@@ -600,8 +601,17 @@ function renderWorkspace(files) {
 function renderConfig(config) {
   if (!config) return;
   document.getElementById('h-model').innerHTML = 'Model: <strong>' + h(config.model) + '</strong>';
-  document.getElementById('h-retries').innerHTML = 'Retries: <strong>—</strong>';
-  document.getElementById('h-replans').innerHTML = 'Replans: <strong>—</strong>';
+}
+
+async function renderUsage() {
+  const data = await fetchJson('/api/usage');
+  const el = document.getElementById('h-usage');
+  if (!data) {
+    el.innerHTML = 'Cost: <strong>—</strong>';
+    return;
+  }
+  el.innerHTML = 'Cost: <strong>' + Number(data.cost || 0).toFixed(4) + '</strong>' +
+    ' (' + (data.requests || 0) + ' req, ' + (data.input || 0) + '/' + (data.output || 0) + ' tok)';
 }
 
 async function renderReplyPanel() {
@@ -700,8 +710,9 @@ async function refresh() {
     renderLog(logText);
     renderWorkspace(workspace ? workspace.files : []);
     renderReplyPanel();
+    renderUsage();
   } catch (e) {
-    setBanner('Cannot connect to dashboard server. Is the agent running with --serve?');
+    setBanner('Cannot connect to dashboard server. Is the agent running?');
   }
 }
 

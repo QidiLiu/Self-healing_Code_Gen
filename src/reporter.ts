@@ -1,4 +1,5 @@
 import { AgentConfig, Checkpoint, Contract, EvaluationResult, AgentReport, AgentPhase } from "./types.js"
+import { loadUsage } from "./state.js"
 import * as fs from "fs"
 import * as path from "path"
 
@@ -12,36 +13,58 @@ export function generateReport(
   contract: Contract | undefined,
   evaluation: EvaluationResult | undefined,
   config: AgentConfig,
+  blocked?: string | null,
 ): AgentReport {
   const isSuccess = checkpoint.phase === "done"
 
   const failures = evaluation?.failures || []
   const contractItems = contract
-    ? { total: contract.items.length, passed: evaluation?.passedCount || 0, failed: evaluation?.failedCount || 0 }
+    ? {
+        total: contract.items.length,
+        passed: evaluation?.passedCount || 0,
+        failed: evaluation?.failedCount || 0,
+      }
     : { total: 0, passed: 0, failed: 0 }
 
   let summary: string
   let blockingIssue: string | null = null
-  let suggestions: string[] = []
+  const suggestions: string[] = []
 
   if (isSuccess) {
     summary = `Successfully implemented the requirements. All ${contractItems.total} contract items passed evaluation.`
   } else {
-    summary = `Could not complete all requirements. ${contractItems.passed} of ${contractItems.total} items passed. ${contractItems.failed} failed after ${checkpoint.retries} retries and ${checkpoint.replanCount} replans.`
+    summary =
+      `Could not complete all requirements. ${contractItems.passed} of ${contractItems.total} items passed. ` +
+      `${contractItems.failed} failed after ${checkpoint.retries} retries, ${checkpoint.replanCount} replans ` +
+      `and ${checkpoint.iterations} loop iterations.`
 
-    if (failures.length > 0) {
+    // An infrastructure or parsing failure is a harness problem, not a code
+    // problem, and must not be dressed up as one.
+    if (blocked) {
+      blockingIssue = blocked
+    } else if (failures.length > 0) {
       blockingIssue = failures
         .filter((f) => f.severity === "critical" || f.severity === "high")
-        .map((f) => f.errorDetail)
+        .map((f) => `${f.itemId}: ${f.errorDetail}`)
         .join("; ")
     }
 
-    suggestions = [
-      "Review the evaluation failures in the state/evaluation.json file",
+    if (checkpoint.infraErrors > 0) {
+      suggestions.push(
+        `The model/provider failed ${checkpoint.infraErrors} time(s); check state/errors.jsonl before touching the code`,
+      )
+    }
+    if (checkpoint.parseErrors > 0) {
+      suggestions.push(
+        `The model returned malformed output ${checkpoint.parseErrors} time(s); see state/debug/ for the raw responses`,
+      )
+    }
+    suggestions.push(
+      "Review the evaluation failures in state/evaluation.json",
       "Check the contract in state/contract.md to see what was expected",
-      "Check the log in state/log.md for detailed trace",
+      "Check the log in state/log.md for a detailed trace",
       "Fix the requirements or provide additional information and restart",
-    ]
+    )
   }
 
   const report: AgentReport = {
@@ -66,10 +89,13 @@ function saveReportFile(report: AgentReport, config: AgentConfig): void {
     fs.mkdirSync(reportDir, { recursive: true })
   }
 
+  const usage = loadUsage(config.stateDir)
+
   let md = `# Agent Report\n\n`
   md += `**Status**: ${report.success ? "SUCCESS" : "STUCK"}\n`
   md += `**Phase**: ${report.phase}\n`
-  md += `**Generated**: ${new Date().toISOString()}\n\n`
+  md += `**Generated**: ${new Date().toISOString()}\n`
+  md += `**Model**: ${config.model}\n\n`
 
   md += `## Summary\n\n${report.summary}\n\n`
 
@@ -98,20 +124,21 @@ function saveReportFile(report: AgentReport, config: AgentConfig): void {
     md += `\n`
   }
 
+  md += `## Cost\n\n`
+  md += `Requests: ${usage.requests}, cost: ${usage.cost.toFixed(4)}, ` +
+    `tokens in/out: ${usage.input}/${usage.output}\n\n`
+
   md += `## Files\n\n`
-  md += `- Contract: \`state/contract.md\`\n`
-  md += `- Progress: \`state/progress.md\`\n`
+  md += `- Contract: \`${path.join(config.stateDir, "contract.md")}\`\n`
+  md += `- Progress: \`${path.join(config.stateDir, "progress.md")}\`\n`
   md += `- Log: \`${report.logPath}\`\n`
+  md += `- Errors: \`${path.join(config.stateDir, "errors.jsonl")}\`\n`
 
   fs.writeFileSync(path.join(reportDir, "report.md"), md)
 
-  const jsonReport = {
-    ...report,
-    failures: report.failures,
-  }
   fs.writeFileSync(
     path.join(reportDir, "report.json"),
-    JSON.stringify(jsonReport, null, 2),
+    JSON.stringify({ ...report, usage }, null, 2),
   )
 }
 

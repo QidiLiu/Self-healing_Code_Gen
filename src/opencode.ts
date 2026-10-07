@@ -1,20 +1,55 @@
 import { createOpencode, OpencodeClient, Config } from "@opencode-ai/sdk"
 import { AgentConfig } from "./types.js"
+import { parseModel } from "./config.js"
 
 export interface OpencodeContext {
   client: OpencodeClient
   server: { url: string; close(): void }
 }
 
+/** Infrastructure failure: the harness could not talk to the model at all. */
+export class OpencodeRequestError extends Error {
+  readonly kind = "infra" as const
+
+  constructor(label: string, message: string) {
+    super(`${label}: ${message}`)
+    this.name = "OpencodeRequestError"
+  }
+}
+
+/** The provider answered, but with an error (auth, rate limit, model not found...). */
+export class ProviderError extends Error {
+  readonly kind = "infra" as const
+
+  constructor(errorName: string, message: string) {
+    super(`provider error ${errorName}: ${message}`)
+    this.name = "ProviderError"
+  }
+}
+
+export class EmptyResponseError extends Error {
+  readonly kind = "infra" as const
+
+  constructor(label: string) {
+    super(`${label}: model returned an empty response`)
+    this.name = "EmptyResponseError"
+  }
+}
+
 let lastConfig: Config | null = null
-let lastPort: number = 4096
+let lastPort = 4096
+
+/**
+ * The SDK defaults to a 5s server start timeout, which is not enough for a cold
+ * opencode boot (config load, provider auth, formatter and LSP plugins).
+ */
+const SERVER_START_TIMEOUT_MS = 60000
 
 export async function startOpencode(
   agentConfig: AgentConfig,
   workspacePath: string,
 ): Promise<OpencodeContext> {
-  const modelParts = agentConfig.model.split("/")
-  const providerID = modelParts[0]
+  const { providerID } = parseModel(agentConfig.model)
 
   const apiKeyEnvVar = `${providerID.toUpperCase()}_API_KEY`
   if (agentConfig.apiKey && !process.env[apiKeyEnvVar]) {
@@ -47,10 +82,11 @@ export async function startOpencode(
   }
 
   lastConfig = config
-  lastPort = 4096
+  lastPort = agentConfig.serverPort
 
   const { client, server } = await createOpencode({
-    port: 4096,
+    port: agentConfig.serverPort,
+    timeout: SERVER_START_TIMEOUT_MS,
     config,
   })
 
@@ -64,10 +100,105 @@ export async function restartOpencode(): Promise<OpencodeContext> {
 
   const { client, server } = await createOpencode({
     port: lastPort,
+    timeout: SERVER_START_TIMEOUT_MS,
     config: lastConfig,
   })
 
   return { client, server }
+}
+
+export function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name
+  return String(err)
+}
+
+/**
+ * Verifies before the loop starts that the configured provider is loaded, that a
+ * key was resolved for it, and that the model id exists. Turns a 10 minute
+ * "planner returned malformed JSON" failure into a 3 second diagnosis.
+ */
+export interface PreflightResult {
+  ok: boolean
+  error?: string
+  hint?: string
+  warning?: string
+}
+
+// Structural access only: keeps this compiling against SDK versions where
+// config.providers() is absent, in which case the check is skipped.
+interface ProvidersClient {
+  config?: {
+    providers?: () => Promise<{ data?: unknown }>
+  }
+}
+
+interface ProviderShape {
+  id?: string
+  key?: string
+  env?: string[]
+  models?: Record<string, unknown>
+}
+
+export async function preflightProvider(
+  client: OpencodeClient,
+  config: AgentConfig,
+): Promise<PreflightResult> {
+  const { providerID, modelID } = parseModel(config.model)
+
+  const providersFn = (client as unknown as ProvidersClient).config?.providers
+  if (typeof providersFn !== "function") {
+    return { ok: true, warning: "provider preflight unavailable in this opencode SDK version" }
+  }
+
+  let data: { providers?: ProviderShape[] }
+  try {
+    const result = await providersFn.call((client as unknown as ProvidersClient).config)
+    if (!result || !result.data) {
+      return { ok: false, error: "opencode returned no provider list." }
+    }
+    data = result.data as { providers?: ProviderShape[] }
+  } catch (err: unknown) {
+    return {
+      ok: false,
+      error: `Could not query opencode providers: ${describeError(err)}`,
+      hint: "Is the opencode server healthy?",
+    }
+  }
+
+  const providers = Array.isArray(data.providers) ? data.providers : []
+  if (providers.length === 0) {
+    return { ok: false, error: "opencode reported zero configured providers." }
+  }
+
+  const provider = providers.find((p) => p.id === providerID)
+  if (!provider) {
+    return {
+      ok: false,
+      error: `Provider "${providerID}" is not available to opencode.`,
+      hint: `Available providers: ${providers.map((p) => p.id).filter(Boolean).join(", ")}`,
+    }
+  }
+
+  if (!provider.key) {
+    return {
+      ok: false,
+      error: `No API key resolved for provider "${providerID}".`,
+      hint:
+        `Set ${provider.env?.[0] || `${providerID.toUpperCase()}_API_KEY`}, ` +
+        "pass --api-key, or fill meta/config.ini [model] api_key.",
+    }
+  }
+
+  const models = Object.keys(provider.models || {})
+  if (models.length > 0 && !models.includes(modelID)) {
+    return {
+      ok: false,
+      error: `Model "${config.model}" does not exist on provider "${providerID}".`,
+      hint: `Available models include: ${models.slice(0, 25).join(", ")}`,
+    }
+  }
+
+  return { ok: true }
 }
 
 export async function createSession(
@@ -80,15 +211,27 @@ export async function createSession(
       body: { title },
       query: directory ? { directory } : undefined,
     })
-    const sessionId = result.data!.id
-    return sessionId
+    if (result.error || !result.data) {
+      throw new OpencodeRequestError("createSession", describeError(result.error) || "no session returned")
+    }
+    return result.data.id
   }, "createSession")
+}
+
+export interface PromptUsage {
+  cost: number
+  input: number
+  output: number
+  reasoning: number
+  cacheRead: number
+  cacheWrite: number
 }
 
 export interface PromptResult {
   text: string
   sessionId: string
   messageId: string
+  usage: PromptUsage
 }
 
 export async function sendPrompt(
@@ -110,48 +253,70 @@ export async function sendPrompt(
       query: directory ? { directory } : undefined,
     })
 
-    const data = result.data!
+    if (result.error || !result.data) {
+      throw new OpencodeRequestError(
+        "sendPrompt",
+        describeError(result.error) || "empty response envelope",
+      )
+    }
+
+    const info = result.data.info
+    if (info.error) {
+      const message =
+        typeof info.error.data === "object" && info.error.data && "message" in info.error.data
+          ? String((info.error.data as { message: string }).message)
+          : describeError(info.error)
+      throw new ProviderError(info.error.name, message)
+    }
+
     let text = ""
-    if (data.parts) {
-      for (const part of data.parts) {
-        if (part.type === "text") {
-          text += (part as { text: string }).text
-        }
+    for (const part of result.data.parts) {
+      if (part.type === "text" && !part.synthetic) {
+        text += part.text
       }
+    }
+
+    if (!text.trim()) {
+      throw new EmptyResponseError("sendPrompt")
     }
 
     return {
       text,
       sessionId,
-      messageId: data.info.id,
+      messageId: info.id,
+      usage: {
+        cost: info.cost ?? 0,
+        input: info.tokens?.input ?? 0,
+        output: info.tokens?.output ?? 0,
+        reasoning: info.tokens?.reasoning ?? 0,
+        cacheRead: info.tokens?.cache?.read ?? 0,
+        cacheWrite: info.tokens?.cache?.write ?? 0,
+      },
     }
   }, "sendPrompt")
 }
 
-export async function waitForSessionIdle(
-  client: OpencodeClient,
-  sessionId: string,
-  timeoutMs: number = 300000,
-  pollIntervalMs: number = 2000,
-): Promise<boolean> {
-  const startTime = Date.now()
-
-  while (Date.now() - startTime < timeoutMs) {
-    const statusResult = await client.session.status()
-    const statuses = statusResult.data!
-
-    if (statuses[sessionId] && statuses[sessionId].type === "idle") {
-      return true
-    }
-
-    await sleep(pollIntervalMs)
-  }
-
-  return false
-}
-
 const MAX_API_RETRIES = 3
 const BASE_RETRY_DELAY = 2000
+
+/** Only failures that can plausibly succeed on a second identical attempt. */
+function isTransient(err: unknown): boolean {
+  const message = describeError(err)
+
+  if (err instanceof TypeError) {
+    return /fetch failed|network|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up/i.test(
+      message,
+    )
+  }
+
+  if (err instanceof ProviderError) {
+    return /rate|429|overload|quota|temporar|timeout|5\d\d|timeout_error/i.test(message)
+  }
+
+  return /fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|socket hang up|429|503|502|504/i.test(
+    message,
+  )
+}
 
 async function withRetry<T>(
   fn: () => Promise<T>,
@@ -166,28 +331,16 @@ async function withRetry<T>(
       lastError = err
 
       if (attempt === MAX_API_RETRIES) break
-
-      const isNetworkError =
-        err instanceof TypeError &&
-        (err.message.includes("fetch failed") ||
-         err.message.includes("network") ||
-         err.message.includes("ECONNREFUSED") ||
-         err.message.includes("ECONNRESET"))
-
-      const delay = BASE_RETRY_DELAY * Math.pow(2, attempt)
-      const errMsg = err instanceof Error ? err.message : String(err)
-
-      if (isNetworkError) {
-        console.error(
-          `  [RETRY] ${label} attempt ${attempt + 1}/${MAX_API_RETRIES} failed: ${errMsg}. ` +
-          `Retrying in ${delay / 1000}s...`
-        )
-      } else {
-        console.error(
-          `  [RETRY] ${label} attempt ${attempt + 1}/${MAX_API_RETRIES} failed: ${errMsg}. ` +
-          `Retrying in ${delay / 1000}s...`
-        )
+      if (!isTransient(err)) {
+        throw err
       }
+
+      const base = BASE_RETRY_DELAY * Math.pow(2, attempt)
+      const delay = Math.round(base * (0.5 + Math.random() * 0.5))
+      console.error(
+        `  [RETRY] ${label} attempt ${attempt + 1}/${MAX_API_RETRIES} failed: ` +
+        `${describeError(err)}. Retrying in ${(delay / 1000).toFixed(1)}s...`,
+      )
 
       await sleep(delay)
     }
@@ -199,3 +352,5 @@ async function withRetry<T>(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
+
+export { sleep }

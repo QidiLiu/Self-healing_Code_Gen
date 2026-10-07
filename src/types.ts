@@ -12,6 +12,12 @@ export interface Checkpoint {
   phase: AgentPhase
   retries: number
   replanCount: number
+  /** Total number of state-machine iterations, used as a hard budget guard. */
+  iterations: number
+  /** Consecutive infrastructure failures (provider/network). Not retried against the code. */
+  infraErrors: number
+  /** Consecutive malformed LLM outputs. */
+  parseErrors: number
   errors: string[]
   lastError: string | null
   plannerSessionId: string | null
@@ -60,6 +66,14 @@ export interface LogEntry {
   detail: string
 }
 
+export interface ErrorEntry {
+  timestamp: string
+  role: string
+  kind: "parse" | "infra" | "llm"
+  message: string
+  hint?: string
+}
+
 export interface AgentReport {
   success: boolean
   phase: AgentPhase
@@ -71,27 +85,34 @@ export interface AgentReport {
   logPath: string
 }
 
-export interface EmailConfig {
-  enabled: boolean
-  recipient: string
-  progressIntervalMinutes: number
-}
-
 export interface ReplyPayload {
   body: string
-  source: "cli" | "web" | "email"
+  source: "cli" | "web"
   timestamp: string
 }
 
+export interface ValidationResult {
+  ok: boolean
+  error?: string
+}
+
 export interface AgentConfig {
+  /** Project root used to locate doc/ and dashboard/ regardless of process.cwd(). */
+  rootDir: string
   requirementsPath: string
   workspacePath: string
   stateDir: string
   outputDir: string
   model: string
   apiKey: string
+  /** Where the API key came from, for logging only. Never the value itself. */
+  apiKeySource: string
+  /** Why key resolution failed, if it did. */
+  apiKeyError: string | null
   baseUrl: string | null
+  serverPort: number
   maxRetries: number
   maxReplans: number
-  email: EmailConfig
+  maxInfraErrors: number
+  maxTotalIterations: number
 }

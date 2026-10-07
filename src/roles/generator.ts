@@ -1,7 +1,7 @@
 import { OpencodeClient } from "@opencode-ai/sdk"
 import { sendPrompt } from "../opencode.js"
 import { Contract, AgentConfig, EvaluationResult } from "../types.js"
-import { appendLog, loadPrinciplesFile } from "../state.js"
+import { appendLog, loadPrinciplesFile, recordUsage } from "../state.js"
 
 const GENERATOR_SYSTEM_PROMPT = `You are a Code Generator. Your sole job is to IMPLEMENT software according to a contract.
 
@@ -80,16 +80,17 @@ export async function runGenerator(
     userPrompt = `CONTRACT - ${contract.overview}\n\nImplement the following requirements:\n\n${contractText}\n\nBuild the complete implementation in the workspace/ directory.`
   }
 
-  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md")
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
   if (loopPrinciples) {
     systemPrompt += `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
   }
-  const codingPrinciples = loadPrinciplesFile("CODING_PRINCIPLES.md")
+  const codingPrinciples = loadPrinciplesFile("CODING_PRINCIPLES.md", config.rootDir)
   if (codingPrinciples) {
     systemPrompt += `\n\n--- CODING PRINCIPLES (follow these strictly) ---\n${codingPrinciples}`
   }
 
   const result = await sendPrompt(client, sessionId, systemPrompt, userPrompt, model, config.workspacePath)
+  recordUsage(config.stateDir, { ...result.usage, requests: 1 })
 
   appendLog(config.stateDir, {
     timestamp: new Date().toISOString(),

@@ -1,7 +1,7 @@
 import { OpencodeClient } from "@opencode-ai/sdk"
 import { sendPrompt } from "../opencode.js"
 import { Contract, ContractItem, AgentConfig } from "../types.js"
-import { appendLog, ensureDir, loadPrinciplesFile } from "../state.js"
+import { appendLog, loadPrinciplesFile, recordUsage } from "../state.js"
 import { parseLLMJson, saveParseDebug } from "../json-parser.js"
 
 const PLANNER_SYSTEM_PROMPT = `You are a Technical Architect specializing in requirement decomposition.
@@ -39,7 +39,8 @@ RULES:
 1. Review the original contract and the evaluation failures.
 2. Decide if the contract was wrong (remove/modify impossible items) or if the implementation was wrong (keep items, adjust descriptions).
 3. Add any missing items that became apparent from the failures.
-4. Keep items you decide to re-attempt.
+4. Keep items you decide to re-attempt, keeping their original ids stable so
+   previous evaluation results still refer to the same requirement.
 
 OUTPUT FORMAT (JSON):
 \`\`\`json
@@ -52,31 +53,122 @@ OUTPUT FORMAT (JSON):
 
 Respond ONLY with the JSON contract. No markdown wrappers, no explanations.`
 
-function parseContractFromText(text: string): Contract {
-  const parseResult = parseLLMJson<Record<string, unknown>>(text)
+const VALID_CATEGORIES: ContractItem["category"][] = [
+  "ui",
+  "logic",
+  "validation",
+  "integration",
+  "testing",
+]
 
-  if (!parseResult.data) {
-    throw new Error(`Failed to parse contract JSON: ${parseResult.error}\n\nRaw text:\n${text.substring(0, 500)}...`)
+const MIN_ITEMS = 1
+const RECOMMENDED_MIN_ITEMS = 8
+const RECOMMENDED_MAX_ITEMS = 35
+const MAX_REPAIR_ATTEMPTS = 2
+
+/** Raised when the planner cannot produce a usable contract. Never a code bug. */
+export class PlannerOutputError extends Error {
+  readonly rawText: string
+
+  constructor(message: string, rawText: string) {
+    super(message)
+    this.name = "PlannerOutputError"
+    this.rawText = rawText
+  }
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0
+}
+
+/**
+ * Strict validation. Filling in defaults for missing fields would turn a
+ * malformed response into a silently wrong contract, which is worse than
+ * failing: the generator would implement requirements nobody asked for.
+ */
+function validateContractData(parsed: Record<string, unknown>): {
+  contract: Contract | null
+  error: string | null
+  warning?: string
+} {
+  if (!isNonEmptyString(parsed.overview)) {
+    return { contract: null, error: "missing non-empty \"overview\"" }
   }
 
-  const parsed = parseResult.data
+  const rawItems = parsed.items
+  if (!Array.isArray(rawItems) || rawItems.length < MIN_ITEMS) {
+    return { contract: null, error: "\"items\" must be a non-empty array" }
+  }
 
-  const items: ContractItem[] = ((parsed.items as Record<string, unknown>[]) || []).map(
-    (item, index: number) => ({
-      id: (item.id as string) || `ITEM-${String(index + 1).padStart(3, "0")}`,
-      description: (item.description as string) || "",
-      category: (item.category as ContractItem["category"]) || "logic",
-      status: "pending" as const,
-      testableAssertion: (item.testableAssertion as string) || (item.description as string) || "",
-    }),
-  )
+  const items: ContractItem[] = []
+  const seenIds = new Set<string>()
+
+  for (let index = 0; index < rawItems.length; index++) {
+    const raw = rawItems[index] as Record<string, unknown>
+    const where = `items[${index}]`
+
+    if (!raw || typeof raw !== "object") {
+      return { contract: null, error: `${where} is not an object` }
+    }
+
+    const id = isNonEmptyString(raw.id) ? raw.id.trim() : ""
+    if (!id) {
+      return { contract: null, error: `${where} is missing a non-empty "id"` }
+    }
+    if (seenIds.has(id)) {
+      return { contract: null, error: `duplicate item id "${id}"` }
+    }
+    seenIds.add(id)
+
+    if (!isNonEmptyString(raw.description)) {
+      return { contract: null, error: `${where} (${id}) is missing "description"` }
+    }
+    if (!isNonEmptyString(raw.testableAssertion)) {
+      return { contract: null, error: `${where} (${id}) is missing "testableAssertion"` }
+    }
+    if (!VALID_CATEGORIES.includes(raw.category as ContractItem["category"])) {
+      return {
+        contract: null,
+        error: `${where} (${id}) has invalid category "${String(raw.category)}" (expected ${VALID_CATEGORIES.join("|")})`,
+      }
+    }
+
+    items.push({
+      id,
+      description: raw.description.trim(),
+      category: raw.category as ContractItem["category"],
+      status: "pending",
+      testableAssertion: raw.testableAssertion.trim(),
+    })
+  }
+
+  let warning: string | undefined
+  if (items.length < RECOMMENDED_MIN_ITEMS || items.length > RECOMMENDED_MAX_ITEMS) {
+    warning = `contract has ${items.length} items, outside the recommended ${RECOMMENDED_MIN_ITEMS}-${RECOMMENDED_MAX_ITEMS} range`
+  }
 
   return {
-    overview: (parsed.overview as string) || "No overview provided",
-    items,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    contract: {
+      overview: parsed.overview.trim(),
+      items,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    },
+    error: null,
+    warning,
   }
+}
+
+function parseContractFromText(text: string): {
+  contract: Contract | null
+  error: string | null
+  warning?: string
+} {
+  const parseResult = parseLLMJson<Record<string, unknown>>(text)
+  if (!parseResult.data) {
+    return { contract: null, error: parseResult.error || "no JSON object found" }
+  }
+  return validateContractData(parseResult.data)
 }
 
 export async function runPlanner(
@@ -91,51 +183,77 @@ export async function runPlanner(
     modelID: config.model.split("/").slice(1).join("/"),
   }
 
-  let userPrompt: string
-  let systemPrompt: string
+  const isReplan = failures !== undefined
 
-  if (failures) {
-    systemPrompt = PLANNER_REPLAN_SYSTEM_PROMPT
-    userPrompt = `ORIGINAL REQUIREMENTS:\n${requirements}\n\nEVALUATION FAILURES (why the previous implementation failed):\n${failures}\n\nProduce an updated contract addressing these failures.`
-  } else {
-    systemPrompt = PLANNER_SYSTEM_PROMPT
-    userPrompt = `REQUIREMENTS:\n${requirements}\n\nProduce a testable contract for this project.`
-  }
+  let systemPrompt = isReplan
+    ? PLANNER_REPLAN_SYSTEM_PROMPT
+    : PLANNER_SYSTEM_PROMPT
+  const userPrompt = isReplan
+    ? `ORIGINAL REQUIREMENTS:\n${requirements}\n\nEVALUATION FAILURES (why the previous implementation failed):\n${failures}\n\nProduce an updated contract addressing these failures.`
+    : `REQUIREMENTS:\n${requirements}\n\nProduce a testable contract for this project.`
 
-  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md")
+  const loopPrinciples = loadPrinciplesFile("LOOP_PRINCIPLES.md", config.rootDir)
   if (loopPrinciples) {
     systemPrompt += `\n\n--- YOUR ROLE IN THIS SYSTEM (from LOOP_PRINCIPLES.md) ---\n${loopPrinciples}`
   }
 
-  const result = await sendPrompt(client, sessionId, systemPrompt, userPrompt, model, config.workspacePath)
+  const phase: "planning" | "replanning" = isReplan ? "replanning" : "planning"
+  const action = isReplan ? "replan" : "plan"
 
-  appendLog(config.stateDir, {
-    timestamp: new Date().toISOString(),
-    phase: failures ? "replanning" : "planning",
-    role: "planner",
-    action: failures ? "replan" : "plan",
-    detail: `Generated contract with ${result.text.length} chars response`,
-  })
+  let result = await sendPrompt(client, sessionId, systemPrompt, userPrompt, model, config.workspacePath)
+  recordUsage(config.stateDir, { ...result.usage, requests: 1 })
 
-  let contract: Contract
-  try {
-    contract = parseContractFromText(result.text)
-  } catch (parseError) {
-    const errorMsg = (parseError as Error).message
+  let parsed = parseContractFromText(result.text)
+  let attempts = 0
+  let lastRawText = result.text
+  let lastError = parsed.error
+
+  while (!parsed.contract && attempts < MAX_REPAIR_ATTEMPTS) {
+    attempts++
+
     saveParseDebug(
       config.stateDir,
-      { data: null, error: errorMsg, rawText: result.text },
+      { data: null, error: parsed.error || "invalid contract", rawText: lastRawText },
       "planner",
     )
     appendLog(config.stateDir, {
       timestamp: new Date().toISOString(),
-      phase: failures ? "replanning" : "planning",
+      phase,
       role: "planner",
       action: "parse_error",
-      detail: `JSON parse failed: ${errorMsg.substring(0, 300)}`,
+      detail: `Contract unusable (attempt ${attempts}): ${(parsed.error || "").slice(0, 300)}`,
     })
-    throw parseError
+
+    const repairPrompt =
+      `Your previous response could not be used: ${parsed.error}\n\n` +
+      `First 1500 characters of your previous response:\n${lastRawText.slice(0, 1500)}\n\n` +
+      `Return ONLY a JSON object of exactly this shape, with no prose and no markdown fences:\n` +
+      `{"overview": "...", "items": [{"id": "ITEM-001", "description": "...", ` +
+      `"category": "ui|logic|validation|integration|testing", "testableAssertion": "..."}]}`
+
+    result = await sendPrompt(client, sessionId, systemPrompt, repairPrompt, model, config.workspacePath)
+    recordUsage(config.stateDir, { ...result.usage, requests: 1 })
+    lastRawText = result.text
+    parsed = parseContractFromText(result.text)
+    lastError = parsed.error
   }
 
-  return contract
+  appendLog(config.stateDir, {
+    timestamp: new Date().toISOString(),
+    phase,
+    role: "planner",
+    action,
+    detail: parsed.contract
+      ? `Generated contract with ${parsed.contract.items.length} items${parsed.warning ? ` (warning: ${parsed.warning})` : ""}`
+      : `Failed to produce a usable contract: ${(lastError || "").slice(0, 200)}`,
+  })
+
+  if (!parsed.contract) {
+    throw new PlannerOutputError(
+      `Planner produced no usable contract after ${attempts} repair attempts: ${lastError}`,
+      lastRawText,
+    )
+  }
+
+  return parsed.contract
 }

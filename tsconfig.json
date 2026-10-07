@@ -16,5 +16,5 @@
     "sourceMap": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "state", "workspace", "output", "requirements"]
+  "exclude": ["node_modules", "dist", "state", "workspace", "output", "requirements", "src/__tests__"]
 }

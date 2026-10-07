@@ -20,15 +20,28 @@ export function parseLLMJson<T>(text: string): ParseResult<T> {
 
   let lastError: string | null = null
 
-  const attempts = [
+  const attempts: { name: string; fn: () => T }[] = [
     { name: "direct", fn: () => JSON.parse(jsonStr) as T },
-    { name: "fix_keys_and_commas", fn: () => JSON.parse(fixUnquotedKeys(fixTrailingCommas(jsonStr))) as T },
+    {
+      name: "fix_keys_and_commas",
+      fn: () => JSON.parse(fixUnquotedKeys(fixTrailingCommas(jsonStr))) as T,
+    },
     { name: "fix_escaped_backticks", fn: () => JSON.parse(jsonStr.replace(/\\`/g, "`")) as T },
-    { name: "fix_unescaped_quotes", fn: () => JSON.parse(fixUnescapedQuotesInStrings(jsonStr)) as T },
-    { name: "fix_newlines", fn: () => JSON.parse(fixUnescapedNewlinesInStrings(jsonStr)) as T },
-    { name: "fix_newlines_keys", fn: () => JSON.parse(fixUnescapedNewlinesInStrings(fixUnquotedKeys(fixTrailingCommas(jsonStr)))) as T },
-    { name: "fix_combined", fn: () => JSON.parse(fixUnescapedNewlinesInStrings(fixUnescapedQuotesInStrings(fixUnquotedKeys(fixTrailingCommas(jsonStr))))) as T },
-    { name: "try_json_repair", fn: () => tryJsonRepair<T>(jsonStr) },
+    {
+      name: "fix_newlines",
+      fn: () => JSON.parse(fixUnescapedControlCharsInStrings(jsonStr)) as T,
+    },
+    {
+      name: "fix_newlines_keys",
+      fn: () =>
+        JSON.parse(
+          fixUnescapedControlCharsInStrings(fixUnquotedKeys(fixTrailingCommas(jsonStr))),
+        ) as T,
+    },
+    {
+      name: "try_json_repair",
+      fn: () => tryJsonRepair<T>(jsonStr),
+    },
   ]
 
   for (const attempt of attempts) {
@@ -43,50 +56,66 @@ export function parseLLMJson<T>(text: string): ParseResult<T> {
   return { data: null, error: lastError || "Unknown parse error", rawText }
 }
 
+/**
+ * Only a leading and a trailing fence are removed. Stripping every fence would
+ * corrupt string values that legitimately contain ``` (e.g. an assertion that
+ * asks for an ```html``` file).
+ */
 function stripMarkdownFences(text: string): string {
-  let result = text
-
-  result = result.replace(/```json\s*\n?/i, "")
-
-  result = result.replace(/```[a-zA-Z]*\s*\n?/g, "")
-
+  let result = text.trim()
+  result = result.replace(/^```[a-zA-Z0-9_-]*[ \t]*\r?\n?/, "")
+  result = result.replace(/```[ \t]*$/, "")
   return result.trim()
 }
 
+/**
+ * Returns the first balanced top-level JSON object.
+ *
+ * Brace counting must be string-aware: contract assertions and error details
+ * routinely contain { } characters, and naive counting truncates the object and
+ * makes every repair strategy operate on a fragment.
+ */
 function extractJsonObject(text: string): string {
   const trimmed = text.trim()
-
-  const firstBrace = trimmed.indexOf("{")
-  if (firstBrace === -1) {
-    const jsonLike = trimmed.match(/\{[\s\S]*\}/)
-    return jsonLike ? jsonLike[0] : ""
-  }
+  const start = trimmed.indexOf("{")
+  if (start === -1) return ""
 
   let depth = 0
-  let endIdx = -1
-  for (let i = firstBrace; i < trimmed.length; i++) {
+  let inString = false
+
+  for (let i = start; i < trimmed.length; i++) {
     const ch = trimmed[i]
-    if (ch === "{") depth++
-    else if (ch === "}") {
+
+    if (inString) {
+      if (ch === "\\") {
+        i++
+        continue
+      }
+      if (ch === '"') inString = false
+      continue
+    }
+
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+
+    if (ch === "{") {
+      depth++
+    } else if (ch === "}") {
       depth--
-      if (depth === 0) { endIdx = i; break }
+      if (depth === 0) return trimmed.slice(start, i + 1)
     }
   }
 
-  if (endIdx !== -1) {
-    return trimmed.substring(firstBrace, endIdx + 1)
-  }
-
-  const jsonLike = trimmed.match(/\{[\s\S]*\}/)
-  return jsonLike ? jsonLike[0] : trimmed.substring(firstBrace)
+  // Unbalanced output (truncated response). Hand the tail to the repair passes.
+  return trimmed.slice(start)
 }
 
 function fixUnquotedKeys(jsonStr: string): string {
   return jsonStr.replace(
     /(['"])?([a-zA-Z_][a-zA-Z0-9_-]*)(['"])?\s*:/g,
-    (match, q1, key, q2) => {
-      return `"${key}":`
-    },
+    (_match, _q1, key, _q2) => `"${key}":`,
   )
 }
 
@@ -94,81 +123,31 @@ function fixTrailingCommas(jsonStr: string): string {
   return jsonStr.replace(/,\s*([}\]])/g, "$1")
 }
 
-function fixUnescapedQuotesInStrings(jsonStr: string): string {
+/**
+ * Replaces raw control characters that appear inside JSON string literals with
+ * their escape sequences. Raw newlines inside a string are the single most
+ * common reason a multi-line LLM JSON response fails to parse.
+ */
+function fixUnescapedControlCharsInStrings(jsonStr: string): string {
   const result: string[] = []
   let inString = false
-  let i = 0
 
-  while (i < jsonStr.length) {
+  for (let i = 0; i < jsonStr.length; i++) {
     const ch = jsonStr[i]
 
-    if (ch === '"' && (i === 0 || jsonStr[i - 1] !== "\\")) {
+    if (ch === '"' && jsonStr[i - 1] !== "\\") {
       inString = !inString
       result.push(ch)
-      i++
       continue
     }
 
-    if (inString && ch === '"') {
-      result.push('\\"')
-      i++
-      continue
-    }
-
-    if (inString && ch === "\n") {
-      result.push("\\n")
-      i++
-      continue
-    }
-
-    if (inString && ch === "\r") {
-      result.push("\\r")
-      i++
-      continue
-    }
-
-    if (inString && ch === "\t") {
-      result.push("\\t")
-      i++
-      continue
+    if (inString) {
+      if (ch === "\n") { result.push("\\n"); continue }
+      if (ch === "\r") { result.push("\\r"); continue }
+      if (ch === "\t") { result.push("\\t"); continue }
     }
 
     result.push(ch)
-    i++
-  }
-
-  return result.join("")
-}
-
-function fixUnescapedNewlinesInStrings(jsonStr: string): string {
-  const result: string[] = []
-  let inString = false
-  let i = 0
-
-  while (i < jsonStr.length) {
-    const ch = jsonStr[i]
-
-    if (ch === '"' && (i === 0 || jsonStr[i - 1] !== "\\")) {
-      inString = !inString
-      result.push(ch)
-      i++
-      continue
-    }
-
-    if (inString && ch === "\n") {
-      result.push("\\n")
-      i++
-      continue
-    }
-
-    if (inString && ch === "\r") {
-      result.push("\\r")
-      i++
-      continue
-    }
-
-    result.push(ch)
-    i++
   }
 
   return result.join("")
@@ -189,18 +168,24 @@ function tryJsonRepair<T>(jsonStr: string): T {
   return JSON.parse(repaired) as T
 }
 
-export function saveParseDebug(stateDir: string, parseResult: ParseResult<unknown>, label: string): void {
+export function saveParseDebug(
+  stateDir: string,
+  parseResult: ParseResult<unknown>,
+  label: string,
+): void {
+  if (!parseResult.rawText && !parseResult.error) return
+
   const dir = path.join(stateDir, "debug")
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true })
   }
 
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
-  const rawPath = path.join(dir, `${label}_${timestamp}_raw.txt`)
-  fs.writeFileSync(rawPath, parseResult.rawText)
 
+  if (parseResult.rawText) {
+    fs.writeFileSync(path.join(dir, `${label}_${timestamp}_raw.txt`), parseResult.rawText)
+  }
   if (parseResult.error) {
-    const errPath = path.join(dir, `${label}_${timestamp}_error.txt`)
-    fs.writeFileSync(errPath, parseResult.error)
+    fs.writeFileSync(path.join(dir, `${label}_${timestamp}_error.txt`), parseResult.error)
   }
 }

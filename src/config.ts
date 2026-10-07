@@ -1,36 +1,106 @@
 import * as fs from "fs"
 import * as path from "path"
-import { AgentConfig, EmailConfig } from "./types.js"
+import { AgentConfig } from "./types.js"
 import { parseIniFile } from "./ini-parser.js"
 
-function readKeyFile(keyPath: string): string {
-  const content = fs.readFileSync(keyPath, "utf-8").trim()
-  return content
+export interface ApiKeyResolution {
+  apiKey: string
+  source: string
+  error?: string
 }
 
-function parseModel(model: string): { providerID: string; modelID: string } {
+export function parseModel(model: string): { providerID: string; modelID: string } {
   const slashIdx = model.indexOf("/")
   if (slashIdx === -1) {
-    throw new Error(`Invalid model format: ${model}. Expected "provider/model"`)
+    throw new Error(`Invalid model format: "${model}". Expected "provider/model"`)
   }
-  return {
-    providerID: model.substring(0, slashIdx),
-    modelID: model.substring(slashIdx + 1),
+  const providerID = model.substring(0, slashIdx)
+  const modelID = model.substring(slashIdx + 1)
+  if (!providerID || !modelID) {
+    throw new Error(`Invalid model format: "${model}". Expected "provider/model"`)
   }
+  return { providerID, modelID }
 }
 
-const DEFAULT_EMAIL_CONFIG: EmailConfig = {
-  enabled: false,
-  recipient: "",
-  progressIntervalMinutes: 30,
+/**
+ * API keys are usually pasted into a Markdown file, so the file may contain
+ * code fences, comments or prose around the key. Take the first line that looks
+ * like a key: no whitespace, not a comment.
+ */
+export function readKeyFile(keyPath: string): { key: string; error?: string } {
+  const raw = fs.readFileSync(keyPath, "utf-8")
+
+  for (const rawLine of raw.split(/\r?\n/)) {
+    let line = rawLine.trim()
+    if (!line) continue
+    line = line.replace(/^```[a-zA-Z]*\s*/, "").replace(/\s*```$/, "").trim()
+    if (!line) continue
+    if (line.startsWith("#") || line.startsWith(">")) continue
+    if (/\s/.test(line)) continue
+    return { key: line }
+  }
+
+  return { key: "", error: `no API key found in ${keyPath}` }
 }
 
 function loadIniConfig(root: string): Record<string, Record<string, string>> {
   const iniPath = path.join(root, "meta", "config.ini")
   if (fs.existsSync(iniPath)) {
-    return parseIniFile(iniPath)
+    try {
+      return parseIniFile(iniPath)
+    } catch {
+      return {}
+    }
   }
   return {}
+}
+
+function iniInt(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  const parsed = parseInt(value, 10)
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+export function resolveApiKey(args: {
+  apiKey?: string
+  apiKeyEnv?: string
+  keyFile?: string
+}, ini: Record<string, Record<string, string>>, model: { providerID: string }): ApiKeyResolution {
+  const root = process.cwd()
+
+  if (args.apiKey) {
+    return { apiKey: args.apiKey, source: "--api-key" }
+  }
+
+  if (args.apiKeyEnv) {
+    const value = process.env[args.apiKeyEnv]
+    if (value) return { apiKey: value, source: `env ${args.apiKeyEnv}` }
+    return { apiKey: "", source: "", error: `--api-key-env ${args.apiKeyEnv} is not set` }
+  }
+
+  const iniKey = (ini.model?.api_key || "").trim()
+  if (iniKey) {
+    return { apiKey: iniKey, source: "meta/config.ini [model] api_key" }
+  }
+
+  const derivedEnv = `${model.providerID.toUpperCase()}_API_KEY`
+  const envValue = process.env[derivedEnv]
+  if (envValue) {
+    return { apiKey: envValue, source: `env ${derivedEnv}` }
+  }
+
+  const keyFile = args.keyFile || path.join(root, "doc", "DEEPSEEK_KEY.md")
+  if (fs.existsSync(keyFile)) {
+    try {
+      const { key, error } = readKeyFile(keyFile)
+      if (key) return { apiKey: key, source: keyFile }
+      return { apiKey: "", source: "", error: error || `no API key found in ${keyFile}` }
+    } catch {
+      return { apiKey: "", source: "", error: `could not read ${keyFile}` }
+    }
+  }
+
+  return { apiKey: "", source: "", error: "" }
 }
 
 export function loadConfig(args: {
@@ -40,35 +110,41 @@ export function loadConfig(args: {
   outputDir?: string
   model?: string
   apiKey?: string
+  apiKeyEnv?: string
   keyFile?: string
   baseUrl?: string
+  serverPort?: number
   maxRetries?: number
   maxReplans?: number
+  maxInfraErrors?: number
+  maxTotalIterations?: number
 }): AgentConfig {
   const root = process.cwd()
   const ini = loadIniConfig(root)
 
-  const keyFile = args.keyFile || path.join(root, "doc", "DEEPSEEK_KEY.md")
-  let apiKey = args.apiKey || ""
-
-  if (!apiKey) {
-    if (fs.existsSync(keyFile)) {
-      apiKey = readKeyFile(keyFile)
-    }
-  }
-
   const model = args.model || ini.model?.provider_model || "deepseek/deepseek-v4-pro"
-  parseModel(model)
+  const parsedModel = parseModel(model)
 
-  const emailConfig: EmailConfig = {
-    enabled: ini.email?.enabled === "true" || DEFAULT_EMAIL_CONFIG.enabled,
-    recipient: ini.email?.recipient || DEFAULT_EMAIL_CONFIG.recipient,
-    progressIntervalMinutes: ini.email?.progress_interval_minutes
-      ? parseInt(ini.email.progress_interval_minutes, 10)
-      : DEFAULT_EMAIL_CONFIG.progressIntervalMinutes,
-  }
+  const keyFile = args.keyFile || path.join(root, "doc", "DEEPSEEK_KEY.md")
+  const resolution = resolveApiKey(
+    { apiKey: args.apiKey, apiKeyEnv: args.apiKeyEnv, keyFile },
+    ini,
+    parsedModel,
+  )
+
+  const maxRetries =
+    args.maxRetries || iniInt(ini.model?.max_retries) || 4
+  const maxReplans =
+    args.maxReplans || iniInt(ini.model?.max_replans) || 2
+  const maxInfraErrors =
+    args.maxInfraErrors || iniInt(ini.model?.max_infra_errors) || 3
+  const maxTotalIterations =
+    args.maxTotalIterations ||
+    iniInt(ini.model?.max_total_iterations) ||
+    (maxRetries + 1) * (maxReplans + 1) + 2
 
   return {
+    rootDir: root,
     requirementsPath: args.requirements
       ? path.resolve(args.requirements)
       : path.join(root, "requirements", "current.md"),
@@ -82,16 +158,14 @@ export function loadConfig(args: {
       ? path.resolve(args.outputDir)
       : path.join(root, "output"),
     model,
-    apiKey,
+    apiKey: resolution.apiKey,
+    apiKeySource: resolution.source,
+    apiKeyError: resolution.error || null,
     baseUrl: args.baseUrl || ini.model?.base_url || null,
-    maxRetries: args.maxRetries
-      || (ini.model?.max_retries ? parseInt(ini.model.max_retries, 10) : undefined)
-      || 4,
-    maxReplans: args.maxReplans
-      || (ini.model?.max_replans ? parseInt(ini.model.max_replans, 10) : undefined)
-      || 2,
-    email: emailConfig,
+    serverPort: args.serverPort || iniInt(ini.model?.server_port) || 4096,
+    maxRetries,
+    maxReplans,
+    maxInfraErrors,
+    maxTotalIterations,
   }
 }
-
-export { parseModel }

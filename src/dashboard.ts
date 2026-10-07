@@ -1,10 +1,24 @@
 import * as http from "node:http"
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { AgentConfig } from "./types.js"
+import { AgentConfig, ReplyPayload } from "./types.js"
 
-const DASHBOARD_HTML_PATH = path.join(process.cwd(), "dashboard", "index.html")
 const POLL_INTERVAL_MS = 2000
+
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  ".cache",
+  "__pycache__",
+  "venv",
+  ".venv",
+])
+
+const MAX_LIST_DEPTH = 6
+const MAX_LIST_FILES = 500
 
 function readJsonFile(filePath: string): object | null {
   try {
@@ -22,22 +36,34 @@ function readTextFile(filePath: string): string | null {
   }
 }
 
-function listWorkspaceFiles(dir: string): string[] {
+/**
+ * Bounded, symlink-free listing. Symlinks are skipped because entry.isFile()
+ * and entry.isDirectory() are both false for them, and a workspace may contain
+ * symlinks pointing anywhere on the host.
+ */
+function listWorkspaceFiles(dir: string, depth = 0, prefix = ""): string[] {
+  if (depth > MAX_LIST_DEPTH) return []
+
+  let result: string[] = []
   try {
-    const result: string[] = []
     const entries = fs.readdirSync(dir, { withFileTypes: true })
     for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name)
+      if (result.length >= MAX_LIST_FILES) break
+      if (SKIP_DIRS.has(entry.name)) continue
+
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name
+
       if (entry.isDirectory()) {
-        result.push(...listWorkspaceFiles(fullPath).map((f) => path.join(entry.name, f)))
-      } else {
-        result.push(entry.name)
+        result = result.concat(listWorkspaceFiles(path.join(dir, entry.name), depth + 1, relative))
+      } else if (entry.isFile()) {
+        result.push(relative)
       }
     }
-    return result.sort()
   } catch {
     return []
   }
+
+  return result.sort()
 }
 
 function jsonResponse(
@@ -74,12 +100,17 @@ export interface DashboardServer {
   close(): void
 }
 
+const WORKSPACE_PREFIX = "/api/workspace/"
+
 export function startDashboard(config: AgentConfig, port: number = 4097): DashboardServer {
   const stateDir = config.stateDir
   const workspacePath = config.workspacePath
+  const workspaceRoot = path.resolve(workspacePath)
+  const htmlPath = path.join(config.rootDir, "dashboard", "index.html")
 
   const server = http.createServer((req, res) => {
-    const url = req.url || "/"
+    // Strip the query string before routing; the raw req.url is not normalised.
+    const pathname = (req.url || "/").split("?")[0]
 
     if (req.method === "OPTIONS") {
       res.writeHead(204, {
@@ -91,57 +122,77 @@ export function startDashboard(config: AgentConfig, port: number = 4097): Dashbo
       return
     }
 
-    if (url === "/" || url === "/index.html") {
-      const html = readTextFile(DASHBOARD_HTML_PATH)
+    if (pathname === "/" || pathname === "/index.html") {
+      const html = readTextFile(htmlPath)
       if (html) {
         htmlResponse(res, html)
       } else {
-        htmlResponse(res, `<!DOCTYPE html><html><body><h1>Dashboard HTML not found at ${DASHBOARD_HTML_PATH}</h1></body></html>`)
+        htmlResponse(res, `<!DOCTYPE html><html><body><h1>Dashboard HTML not found at ${htmlPath}</h1></body></html>`)
       }
       return
     }
 
-    if (url === "/api/checkpoint") {
-      const data = readJsonFile(path.join(stateDir, "checkpoint.json"))
-      return jsonResponse(res, data)
+    if (pathname === "/api/checkpoint") {
+      return jsonResponse(res, readJsonFile(path.join(stateDir, "checkpoint.json")))
     }
 
-    if (url === "/api/contract") {
-      const data = readJsonFile(path.join(stateDir, "contract.json"))
-      return jsonResponse(res, data)
+    if (pathname === "/api/contract") {
+      return jsonResponse(res, readJsonFile(path.join(stateDir, "contract.json")))
     }
 
-    if (url === "/api/evaluation") {
-      const data = readJsonFile(path.join(stateDir, "evaluation.json"))
-      return jsonResponse(res, data)
+    if (pathname === "/api/evaluation") {
+      return jsonResponse(res, readJsonFile(path.join(stateDir, "evaluation.json")))
     }
 
-    if (url === "/api/progress") {
+    if (pathname === "/api/usage") {
+      return jsonResponse(res, readJsonFile(path.join(stateDir, "usage.json")))
+    }
+
+    if (pathname === "/api/progress") {
       const text = readTextFile(path.join(stateDir, "progress.md"))
       return textResponse(res, text || "")
     }
 
-    if (url === "/api/log") {
+    if (pathname === "/api/log") {
       const text = readTextFile(path.join(stateDir, "log.md"))
       return textResponse(res, text || "")
     }
 
-    if (url === "/api/config") {
+    if (pathname === "/api/config") {
       return jsonResponse(res, {
         model: config.model,
         maxRetries: config.maxRetries,
         maxReplans: config.maxReplans,
+        maxInfraErrors: config.maxInfraErrors,
+        maxTotalIterations: config.maxTotalIterations,
         requirementsPath: config.requirementsPath,
       })
     }
 
-    if (url === "/api/workspace") {
-      const files = listWorkspaceFiles(workspacePath)
-      return jsonResponse(res, { files })
+    if (pathname === "/api/workspace") {
+      const files = listWorkspaceFiles(workspaceRoot)
+      return jsonResponse(res, { files, pollIntervalMs: POLL_INTERVAL_MS })
     }
 
-    if (url.startsWith("/api/workspace/")) {
-      const filePath = path.join(workspacePath, url.replace("/api/workspace/", ""))
+    if (pathname.startsWith(WORKSPACE_PREFIX)) {
+      let requested: string
+      try {
+        requested = decodeURIComponent(pathname.slice(WORKSPACE_PREFIX.length))
+      } catch {
+        return jsonResponse(res, { error: "Bad path encoding" }, 400)
+      }
+
+      if (!requested || requested.includes("\0")) {
+        return jsonResponse(res, { error: "Bad path" }, 400)
+      }
+
+      // Resolve then confirm containment. Without this, "/api/workspace/../../x"
+      // reads any file the harness can read.
+      const filePath = path.resolve(workspaceRoot, requested)
+      if (filePath !== workspaceRoot && !filePath.startsWith(workspaceRoot + path.sep)) {
+        return jsonResponse(res, { error: "Forbidden" }, 403)
+      }
+
       const text = readTextFile(filePath)
       if (text !== null) {
         return textResponse(res, text)
@@ -149,28 +200,40 @@ export function startDashboard(config: AgentConfig, port: number = 4097): Dashbo
       return jsonResponse(res, { error: "File not found" }, 404)
     }
 
-    if (url === "/api/reply-status") {
+    if (pathname === "/api/reply-status") {
       const cp = readJsonFile(path.join(stateDir, "checkpoint.json")) as { phase?: string } | null
       const waiting = cp?.phase === "done" || cp?.phase === "stuck"
       return jsonResponse(res, { waiting })
     }
 
-    if (url === "/api/reply" && req.method === "POST") {
-      const buffers: Buffer[] = []
-      req.on("data", (chunk: Buffer) => buffers.push(chunk))
+    if (pathname === "/api/reply" && req.method === "POST") {
+      const chunks: Buffer[] = []
+      let size = 0
+      req.on("data", (chunk: Buffer) => {
+        size += chunk.length
+        if (size > 1024 * 1024) {
+          req.destroy()
+          return
+        }
+        chunks.push(chunk)
+      })
       req.on("end", () => {
-        const raw = Buffer.concat(buffers).toString("utf-8")
+        if (req.destroyed) return
+
+        const raw = Buffer.concat(chunks).toString("utf-8")
         let body = ""
         try {
-          const parsed = JSON.parse(raw)
-          body = String(parsed.body || parsed.instructions || "")
+          const parsed = JSON.parse(raw) as Partial<ReplyPayload>
+          body = String(parsed.body || "")
         } catch {
           body = raw.trim()
         }
-        if (!body) {
+
+        if (!body.trim()) {
           return jsonResponse(res, { ok: false, error: "empty body" }, 400)
         }
-        const payload = {
+
+        const payload: ReplyPayload = {
           body,
           source: "web",
           timestamp: new Date().toISOString(),
@@ -184,12 +247,17 @@ export function startDashboard(config: AgentConfig, port: number = 4097): Dashbo
     jsonResponse(res, { error: "Not found" }, 404)
   })
 
-  server.listen(port, () => {
+  // Loopback only. The dashboard exposes the workspace and accepts commands that
+  // rewrite the requirements file, so it must not be reachable from the LAN.
+  server.listen(port, "127.0.0.1", () => {
     console.log(`Dashboard server running at http://localhost:${port}`)
   })
 
   return {
     url: `http://localhost:${port}`,
-    close: () => server.close(),
+    close: () => {
+      server.closeAllConnections()
+      server.close()
+    },
   }
 }
